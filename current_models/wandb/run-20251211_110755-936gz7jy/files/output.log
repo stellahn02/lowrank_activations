@@ -1,0 +1,70 @@
+Map: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 51760/51760 [00:41<00:00, 1253.16 examples/s]
+labels[0][:40]: tensor([  101,  2917,  2003,  2019,  7899,  2008,  5577,  1037,  4708,  1012,
+         4339,  1037,  3433,  2008, 23263, 28123,  1996,  5227,  1012,  1001,
+         1001,  1001,  7899,  1024,  9699,  1019, 20932,  2005,  1996,  9046,
+         2149,  4883,  3864,  1012,  1001,  1001,  1001,  3433,  1024,  1015])
+unique labels: tensor([ -100,   101,   102,   999,  1000,  1001,  1005,  1010,  1011,  1012,
+         1015,  1016,  1017,  1018,  1019,  1024,  1029,  1037,  1045,  1049,
+         1055,  1062,  1996,  1997,  1998,  1999,  2000,  2003,  2004,  2005,
+         2006,  2007,  2008,  2009,  2015,  2016,  2017,  2019,  2021,  2022,
+         2023,  2024,  2026,  2027,  2033,  2035,  2037,  2039,  2041,  2043,
+         2044,  2045,  2048,  2054,  2055,  2060,  2061,  2062,  2066,  2074,
+         2079,  2090,  2091,  2097,  2111,  2113,  2115,  2119,  2121,  2128,
+         2129,  2131,  2149,  2152,  2154,  2172,  2177,  2191,  2204,  2205,
+         2216,  2220,  2224,  2256,  2267,  2272,  2287,  2293,  2296,  2342,
+         2362,  2377,  2398,  2399,  2406,  2428,  2445,  2466,  2490,  2535,
+         2549,  2582,  2591,  2599,  2689,  2773,  2865,  2875,  2878,  2917,
+         2941,  2943,  2954,  2974,  3049,  3111,  3185,  3277,  3278,  3340,
+         3343,  3376,  3398,  3427,  3433,  3444,  3488,  3494,  3497,  3573,
+         3601,  3617,  3618,  3623,  3632,  3640,  3652,  3679,  3806,  3864,
+         3920,  3978,  4121,  4145,  4150,  4152,  4204,  4216,  4245,  4285,
+         4339,  4396,  4455,  4708,  4785,  4883,  4931,  4978,  5117,  5227,
+         5290,  5347,  5440,  5446,  5470,  5546,  5547,  5574,  5577,  5653,
+         5683,  6022,  6092,  6123,  6135,  6149,  6199,  6251,  6346,  6387,
+         6429,  6639,  6653,  6830,  6832,  7047,  7206,  7532,  7879,  7899,
+         7950,  7953,  7982,  8008,  8348,  8680,  8977,  9012,  9046,  9100,
+         9424,  9458,  9570,  9699, 10317, 10340, 10537, 10645, 11107, 11379,
+        11768, 12476, 12479, 12739, 12908, 13366, 13918, 14303, 14500, 14936,
+        15512, 15766, 15929, 15982, 16594, 16635, 16798, 18351, 18524, 18759,
+        20859, 20932, 21358, 21991, 22701, 23263, 24355, 24732, 28123])
+ignore_index in CE: -100
+Synthetic test loss: 0.0
+step=0000 | loss=0.0000 | lr=5.00e-05 | grad_norm=0.00 | mem_alloc=16785.1MB mem_peak=20927.7MB mem_reserved=22840.1MB
+step=0001 | loss=0.0000 | lr=5.00e-05 | grad_norm=0.00 | mem_alloc=16784.3MB mem_peak=20971.4MB mem_reserved=23343.4MB
+step=0002 | loss=0.0000 | lr=5.00e-05 | grad_norm=0.00 | mem_alloc=16785.1MB mem_peak=20971.4MB mem_reserved=23343.4MB
+step=0003 | loss=0.0000 | lr=5.00e-05 | grad_norm=0.00 | mem_alloc=16785.1MB mem_peak=20972.2MB mem_reserved=23343.4MB
+step=0004 | loss=0.0000 | lr=5.00e-05 | grad_norm=0.00 | mem_alloc=16785.1MB mem_peak=20972.2MB mem_reserved=23343.4MB
+step=0005 | loss=0.0000 | lr=5.00e-05 | grad_norm=0.00 | mem_alloc=16785.1MB mem_peak=20972.2MB mem_reserved=23343.4MB
+step=0006 | loss=0.0000 | lr=5.00e-05 | grad_norm=0.00 | mem_alloc=16785.1MB mem_peak=20972.2MB mem_reserved=23410.5MB
+Traceback (most recent call last):
+  File "/orcd/home/002/hyewona/lr-act/current_models/baseline_model_v2.py", line 286, in <module>
+    main()
+    ~~~~^^
+  File "/orcd/home/002/hyewona/lr-act/current_models/baseline_model_v2.py", line 250, in main
+    loss.backward()
+    ~~~~~~~~~~~~~^^
+  File "/orcd/home/002/hyewona/lr-act/lora/lib/python3.13/site-packages/torch/_tensor.py", line 625, in backward
+    torch.autograd.backward(
+    ~~~~~~~~~~~~~~~~~~~~~~~^
+        self, gradient, retain_graph, create_graph, inputs=inputs
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/orcd/home/002/hyewona/lr-act/lora/lib/python3.13/site-packages/torch/autograd/__init__.py", line 354, in backward
+    _engine_run_backward(
+    ~~~~~~~~~~~~~~~~~~~~^
+        tensors,
+        ^^^^^^^^
+    ...<5 lines>...
+        accumulate_grad=True,
+        ^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/orcd/home/002/hyewona/lr-act/lora/lib/python3.13/site-packages/torch/autograd/graph.py", line 841, in _engine_run_backward
+    return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        t_outputs, *args, **kwargs
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )  # Calls into the C++ engine to run the backward pass
+    ^
+KeyboardInterrupt

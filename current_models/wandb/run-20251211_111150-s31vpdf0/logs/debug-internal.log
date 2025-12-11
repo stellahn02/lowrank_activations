@@ -1,0 +1,11 @@
+{"time":"2025-12-11T11:11:50.615099993-05:00","level":"INFO","msg":"stream: starting","core version":"0.22.3"}
+{"time":"2025-12-11T11:11:50.833467236-05:00","level":"INFO","msg":"stream: created new stream","id":"s31vpdf0"}
+{"time":"2025-12-11T11:11:50.833508637-05:00","level":"INFO","msg":"handler: started","stream_id":"s31vpdf0"}
+{"time":"2025-12-11T11:11:50.834104427-05:00","level":"INFO","msg":"stream: started","id":"s31vpdf0"}
+{"time":"2025-12-11T11:11:50.834113706-05:00","level":"INFO","msg":"writer: started","stream_id":"s31vpdf0"}
+{"time":"2025-12-11T11:11:50.834116044-05:00","level":"INFO","msg":"sender: started","stream_id":"s31vpdf0"}
+{"time":"2025-12-11T11:12:36.9525242-05:00","level":"INFO","msg":"stream: closing","id":"s31vpdf0"}
+{"time":"2025-12-11T11:12:37.278606945-05:00","level":"INFO","msg":"fileTransfer: Close: file transfer manager closed"}
+{"time":"2025-12-11T11:12:37.549778704-05:00","level":"INFO","msg":"handler: closed","stream_id":"s31vpdf0"}
+{"time":"2025-12-11T11:12:37.551167069-05:00","level":"INFO","msg":"sender: closed","stream_id":"s31vpdf0"}
+{"time":"2025-12-11T11:12:37.551178143-05:00","level":"INFO","msg":"stream: closed","id":"s31vpdf0"}

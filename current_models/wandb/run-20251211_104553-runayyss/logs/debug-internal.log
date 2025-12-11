@@ -1,0 +1,11 @@
+{"time":"2025-12-11T10:45:53.531456018-05:00","level":"INFO","msg":"stream: starting","core version":"0.22.3"}
+{"time":"2025-12-11T10:45:53.764416728-05:00","level":"INFO","msg":"stream: created new stream","id":"runayyss"}
+{"time":"2025-12-11T10:45:53.76446712-05:00","level":"INFO","msg":"handler: started","stream_id":"runayyss"}
+{"time":"2025-12-11T10:45:53.765056475-05:00","level":"INFO","msg":"stream: started","id":"runayyss"}
+{"time":"2025-12-11T10:45:53.765067645-05:00","level":"INFO","msg":"writer: started","stream_id":"runayyss"}
+{"time":"2025-12-11T10:45:53.765071299-05:00","level":"INFO","msg":"sender: started","stream_id":"runayyss"}
+{"time":"2025-12-11T10:46:29.992451729-05:00","level":"INFO","msg":"stream: closing","id":"runayyss"}
+{"time":"2025-12-11T10:46:30.35385638-05:00","level":"INFO","msg":"fileTransfer: Close: file transfer manager closed"}
+{"time":"2025-12-11T10:46:30.510187367-05:00","level":"INFO","msg":"handler: closed","stream_id":"runayyss"}
+{"time":"2025-12-11T10:46:30.511306345-05:00","level":"INFO","msg":"sender: closed","stream_id":"runayyss"}
+{"time":"2025-12-11T10:46:30.511314588-05:00","level":"INFO","msg":"stream: closed","id":"runayyss"}

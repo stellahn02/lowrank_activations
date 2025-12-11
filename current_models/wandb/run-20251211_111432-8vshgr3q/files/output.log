@@ -1,0 +1,62 @@
+labels[0][:40]: tensor([  101,  2917,  2003,  2019,  7899,  2008,  5577,  1037,  4708,  1012,
+         4339,  1037,  3433,  2008, 23263, 28123,  1996,  5227,  1012,  1001,
+         1001,  1001,  7899,  1024,  6709,  1996,  2828,  1997,  1996,  2206,
+         6251,  1024,  1000,  2198,  2003,  2770,  2397,  2005,  2147,  2651])
+unique labels: tensor([    0,   101,   102,  1000,  1001,  1009,  1010,  1011,  1012,  1015,
+         1016,  1017,  1018,  1019,  1022,  1024,  1027,  1037,  1060,  1996,
+         1997,  1998,  1999,  2000,  2003,  2004,  2005,  2006,  2007,  2008,
+         2009,  2015,  2019,  2022,  2024,  2025,  2027,  2030,  2031,  2037,
+         2043,  2046,  2047,  2048,  2054,  2062,  2063,  2064,  2065,  2069,
+         2070,  2075,  2111,  2147,  2151,  2178,  2182,  2198,  2202,  2206,
+         2339,  2397,  2410,  2437,  2445,  2514,  2582,  2590,  2592,  2625,
+         2651,  2681,  2691,  2770,  2828,  2836,  2875,  2877,  2896,  2917,
+         2989,  3020,  3029,  3105,  3112,  3113,  3125,  3207,  3278,  3289,
+         3298,  3366,  3433,  3452,  3497,  3640,  3737,  3745,  3893,  3930,
+         3937,  4044,  4226,  4254,  4339,  4436,  4708,  4748,  4784,  4861,
+         4942,  5117,  5126,  5197,  5218,  5227,  5366,  5577,  5662,  5897,
+         6123,  6165,  6251,  6434,  6469,  6493,  6709,  7166,  7457,  7678,
+         7729,  7814,  7817,  7860,  7899,  7904,  7953,  8017,  8082,  8114,
+         8147,  8522,  8628,  8785,  9002,  9353,  9699,  9721,  9967, 10463,
+        10910, 11241, 11703, 11757, 12024, 12739, 12774, 12992, 13296, 13318,
+        13531, 14354, 14842, 14877, 15836, 16165, 16171, 16409, 16636, 16829,
+        17207, 20125, 20880, 20991, 23263, 24970, 28123])
+ignore_index in CE: -100
+Synthetic test loss: 0.0
+step=0000 | loss=0.0000 | lr=5.00e-05 | grad_norm=0.00 | mem_alloc=16715.8MB mem_peak=20858.4MB mem_reserved=22770.9MB
+step=0001 | loss=0.0000 | lr=5.00e-05 | grad_norm=0.00 | mem_alloc=16715.0MB mem_peak=20902.1MB mem_reserved=23274.2MB
+step=0002 | loss=0.0000 | lr=5.00e-05 | grad_norm=0.00 | mem_alloc=16715.8MB mem_peak=20902.1MB mem_reserved=23274.2MB
+step=0003 | loss=0.0000 | lr=5.00e-05 | grad_norm=0.00 | mem_alloc=16715.8MB mem_peak=20902.9MB mem_reserved=23274.2MB
+step=0004 | loss=0.0000 | lr=5.00e-05 | grad_norm=0.00 | mem_alloc=16715.8MB mem_peak=20902.9MB mem_reserved=23274.2MB
+step=0005 | loss=0.0000 | lr=5.00e-05 | grad_norm=0.00 | mem_alloc=16715.8MB mem_peak=20902.9MB mem_reserved=23274.2MB
+Traceback (most recent call last):
+  File "/orcd/home/002/hyewona/lr-act/current_models/baseline_model_v2.py", line 293, in <module>
+    main()
+    ~~~~^^
+  File "/orcd/home/002/hyewona/lr-act/current_models/baseline_model_v2.py", line 257, in main
+    loss.backward()
+    ~~~~~~~~~~~~~^^
+  File "/orcd/home/002/hyewona/lr-act/lora/lib/python3.13/site-packages/torch/_tensor.py", line 625, in backward
+    torch.autograd.backward(
+    ~~~~~~~~~~~~~~~~~~~~~~~^
+        self, gradient, retain_graph, create_graph, inputs=inputs
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/orcd/home/002/hyewona/lr-act/lora/lib/python3.13/site-packages/torch/autograd/__init__.py", line 354, in backward
+    _engine_run_backward(
+    ~~~~~~~~~~~~~~~~~~~~^
+        tensors,
+        ^^^^^^^^
+    ...<5 lines>...
+        accumulate_grad=True,
+        ^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/orcd/home/002/hyewona/lr-act/lora/lib/python3.13/site-packages/torch/autograd/graph.py", line 841, in _engine_run_backward
+    return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        t_outputs, *args, **kwargs
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )  # Calls into the C++ engine to run the backward pass
+    ^
+KeyboardInterrupt

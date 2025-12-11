@@ -1,0 +1,74 @@
+labels[0][:40]: tensor([  101,  2917,  2003,  2019,  7899,  2008,  5577,  1037,  4708,  1012,
+         4339,  1037,  3433,  2008, 23263, 28123,  1996,  5227,  1012,  1001,
+         1001,  1001,  7899,  1024,  2054,  2003,  1996,  4587,  2124,  2311,
+         1999,  2634,  1029,  1001,  1001,  1001,  3433,  1024,  1996,  4587])
+unique labels: tensor([    0,   101,   102,   999,  1000,  1001,  1005,  1006,  1007,  1010,
+         1011,  1012,  1024,  1029,  1037,  1045,  1056,  1996,  1997,  1998,
+         1999,  2000,  2001,  2003,  2004,  2005,  2006,  2007,  2008,  2009,
+         2010,  2011,  2012,  2013,  2014,  2016,  2019,  2020,  2021,  2022,
+         2023,  2024,  2027,  2028,  2029,  2030,  2031,  2037,  2038,  2039,
+         2040,  2043,  2044,  2046,  2047,  2048,  2049,  2050,  2051,  2053,
+         2054,  2060,  2062,  2064,  2065,  2071,  2072,  2073,  2074,  2075,
+         2076,  2079,  2080,  2088,  2096,  2097,  2099,  2105,  2107,  2112,
+         2115,  2121,  2123,  2124,  2132,  2138,  2143,  2147,  2150,  2152,
+         2154,  2155,  2162,  2179,  2180,  2192,  2209,  2211,  2215,  2219,
+         2245,  2272,  2305,  2311,  2320,  2328,  2339,  2345,  2362,  2363,
+         2364,  2365,  2376,  2397,  2437,  2445,  2449,  2454,  2462,  2481,
+         2485,  2498,  2522,  2524,  2551,  2566,  2574,  2582,  2588,  2590,
+         2622,  2632,  2634,  2641,  2644,  2655,  2659,  2663,  2667,  2690,
+         2745,  2767,  2769,  2810,  2814,  2854,  2862,  2903,  2917,  2924,
+         2926,  2928,  2963,  2965,  2974,  3020,  3029,  3052,  3085,  3112,
+         3120,  3154,  3191,  3209,  3248,  3295,  3322,  3379,  3419,  3433,
+         3452,  3463,  3494,  3532,  3640,  3711,  3720,  3737,  3750,  3787,
+         3811,  3992,  4089,  4122,  4158,  4192,  4339,  4383,  4395,  4435,
+         4506,  4526,  4532,  4587,  4629,  4697,  4708,  4735,  4784,  4800,
+         4863,  4871,  4903,  4960,  5092,  5107,  5160,  5227,  5318,  5394,
+         5491,  5577,  5637,  5643,  5700,  5740,  5813,  5853,  5889,  6022,
+         6123,  6140,  6254,  6267,  6317,  6627,  6631,  6709,  6845,  6851,
+         6981,  6987,  7461,  7680,  7790,  7814,  7849,  7899,  7922,  7953,
+         7992,  8010,  8277,  8436,  8826,  8945,  9105,  9584,  9994, 10251,
+        10705, 10939, 11585, 11903, 12654, 12713, 12739, 12754, 12816, 13539,
+        13742, 14036, 14397, 14819, 14925, 15213, 15338, 15563, 15583, 15594,
+        15697, 16178, 16425, 16463, 16565, 16677, 16724, 19114, 20927, 22138,
+        22147, 22752, 23222, 23263, 23320, 23834, 24404, 25550, 25861, 27725,
+        28123, 28916])
+ignore_index in CE: -100
+tensor([  101,  2917,  2003,  2019,  7899,  2008,  5577,  1037,  4708,  1012,
+         4339,  1037,  3433,  2008, 23263, 28123,  1996,  5227,  1012,  1001,
+         1001,  1001,  7899,  1024,  2129,  2515,  1037,  3274,  2448,  1037,
+         3698,  4083,  9896,  1029,  1001,  1001,  1001,  3433,  1024,  1037,
+         3274,  3216,  1037,  3698,  4083,  9896,  2011,  2478,  2049,  8051])
+step=0000 | loss=0.0000 | lr=5.00e-05 | grad_norm=0.00 | mem_alloc=16713.4MB mem_peak=20856.0MB mem_reserved=22770.9MB
+step=0001 | loss=0.0000 | lr=5.00e-05 | grad_norm=0.00 | mem_alloc=16712.6MB mem_peak=20899.7MB mem_reserved=23274.2MB
+step=0002 | loss=0.0000 | lr=5.00e-05 | grad_norm=0.00 | mem_alloc=16713.4MB mem_peak=20900.5MB mem_reserved=23274.2MB
+step=0003 | loss=0.0000 | lr=5.00e-05 | grad_norm=0.00 | mem_alloc=16713.4MB mem_peak=20900.5MB mem_reserved=23274.2MB
+step=0004 | loss=0.0000 | lr=5.00e-05 | grad_norm=0.00 | mem_alloc=16713.4MB mem_peak=20900.5MB mem_reserved=23274.2MB
+step=0005 | loss=0.0000 | lr=5.00e-05 | grad_norm=0.00 | mem_alloc=16713.4MB mem_peak=20900.5MB mem_reserved=23274.2MB
+step=0006 | loss=0.0000 | lr=5.00e-05 | grad_norm=0.00 | mem_alloc=16713.4MB mem_peak=20900.5MB mem_reserved=23274.2MB
+step=0007 | loss=0.0000 | lr=5.00e-05 | grad_norm=0.00 | mem_alloc=16713.4MB mem_peak=20900.5MB mem_reserved=23274.2MB
+step=0008 | loss=0.0000 | lr=5.00e-05 | grad_norm=0.00 | mem_alloc=16713.4MB mem_peak=20900.5MB mem_reserved=23274.2MB
+step=0009 | loss=0.0000 | lr=5.00e-05 | grad_norm=0.00 | mem_alloc=16713.4MB mem_peak=20900.5MB mem_reserved=23274.2MB
+step=0010 | loss=0.0000 | lr=4.99e-05 | grad_norm=0.00 | mem_alloc=16713.4MB mem_peak=20900.5MB mem_reserved=23274.2MB
+step=0011 | loss=0.0000 | lr=4.99e-05 | grad_norm=0.00 | mem_alloc=16713.4MB mem_peak=20900.5MB mem_reserved=23274.2MB
+step=0012 | loss=0.0000 | lr=4.99e-05 | grad_norm=0.00 | mem_alloc=16713.4MB mem_peak=20900.5MB mem_reserved=23274.2MB
+step=0013 | loss=0.0000 | lr=4.99e-05 | grad_norm=0.00 | mem_alloc=16713.4MB mem_peak=20900.5MB mem_reserved=23274.2MB
+step=0014 | loss=0.0000 | lr=4.99e-05 | grad_norm=0.00 | mem_alloc=16713.4MB mem_peak=20900.5MB mem_reserved=23341.3MB
+step=0015 | loss=0.0000 | lr=4.99e-05 | grad_norm=0.00 | mem_alloc=16713.4MB mem_peak=20900.5MB mem_reserved=23341.3MB
+step=0016 | loss=0.0000 | lr=4.99e-05 | grad_norm=0.00 | mem_alloc=16713.4MB mem_peak=20900.5MB mem_reserved=23341.3MB
+step=0017 | loss=0.0000 | lr=4.98e-05 | grad_norm=0.00 | mem_alloc=16713.4MB mem_peak=20900.5MB mem_reserved=23341.3MB
+step=0018 | loss=0.0000 | lr=4.98e-05 | grad_norm=0.00 | mem_alloc=16713.4MB mem_peak=20900.5MB mem_reserved=23341.3MB
+step=0019 | loss=0.0000 | lr=4.98e-05 | grad_norm=0.00 | mem_alloc=16713.4MB mem_peak=20900.5MB mem_reserved=23341.3MB
+step=0020 | loss=0.0000 | lr=4.98e-05 | grad_norm=0.00 | mem_alloc=16713.4MB mem_peak=20900.5MB mem_reserved=23341.3MB
+step=0021 | loss=0.0000 | lr=4.98e-05 | grad_norm=0.00 | mem_alloc=16713.4MB mem_peak=20900.5MB mem_reserved=23341.3MB
+step=0022 | loss=0.0000 | lr=4.97e-05 | grad_norm=0.00 | mem_alloc=16713.4MB mem_peak=20900.5MB mem_reserved=23341.3MB
+step=0023 | loss=0.0000 | lr=4.97e-05 | grad_norm=0.00 | mem_alloc=16713.4MB mem_peak=20900.5MB mem_reserved=23341.3MB
+step=0024 | loss=0.0000 | lr=4.97e-05 | grad_norm=0.00 | mem_alloc=16713.4MB mem_peak=20900.5MB mem_reserved=23341.3MB
+step=0025 | loss=0.0000 | lr=4.97e-05 | grad_norm=0.00 | mem_alloc=16713.4MB mem_peak=20900.5MB mem_reserved=23341.3MB
+Traceback (most recent call last):
+  File "/orcd/home/002/hyewona/lr-act/current_models/baseline_model_v2.py", line 280, in <module>
+    main()
+    ~~~~^^
+  File "/orcd/home/002/hyewona/lr-act/current_models/baseline_model_v2.py", line 257, in main
+    "loss": float(loss.item()),
+                  ~~~~~~~~~^^
+KeyboardInterrupt
