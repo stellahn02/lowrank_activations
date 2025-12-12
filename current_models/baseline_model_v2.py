@@ -1,9 +1,11 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import wandb
-from transformers import AutoTokenizer
-from alpaca_dataset import get_alpaca_dataloader
+from torch.utils.data import random_split, DataLoader
+from transformers import AutoTokenizer, AutoModel
+from alpaca_dataset import get_alpaca_dataloader, build_alpaca_dataset, get_alpaca_tokenizer
 
 wandb.init(project="baseline_model_llama32_like")
 
@@ -16,7 +18,6 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x):
-        # Closer to standard RMSNorm: use mean of squared elements
         norm = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
         return self.weight * x * norm
 
@@ -30,12 +31,9 @@ def apply_rope(x, position_ids, rope_theta=500000):
     b, h, s, hd = x.shape
     device, dtype = x.device, x.dtype
 
-    # (hd/2,)
     inv_freq = 1.0 / (rope_theta ** (torch.arange(0, hd, 2, device=device, dtype=dtype) / hd))
-    # (B, S, hd/2)
     freqs = torch.einsum("bs,d->bsd", position_ids.to(dtype), inv_freq)
     sin, cos = freqs.sin(), freqs.cos()
-    # (B, 1, S, hd/2)
     sin = sin.unsqueeze(1)
     cos = cos.unsqueeze(1)
 
@@ -46,47 +44,6 @@ def apply_rope(x, position_ids, rope_theta=500000):
     x_rope[..., ::2] = x1 * cos - x2 * sin
     x_rope[..., 1::2] = x2 * cos + x1 * sin
     return x_rope
-
-class SimpleMHA(nn.Module):
-    def __init__(self, dim, n_heads, attn_dropout=0.0):
-        super().__init__()
-        self.n_heads = n_heads
-        self.head_dim = dim // n_heads
-
-        self.q_proj = nn.Linear(dim, dim, bias=False)
-        self.k_proj = nn.Linear(dim, dim, bias=False)
-        self.v_proj = nn.Linear(dim, dim, bias=False)
-        self.out_proj = nn.Linear(dim, dim, bias=False)
-        self.attn_dropout = nn.Dropout(attn_dropout)
-
-    def forward(self, x, attn_mask=None):
-        B, S, D = x.shape
-        H, hd = self.n_heads, self.head_dim
-
-        q = self.q_proj(x).view(B, S, H, hd).transpose(1, 2)  # (B,H,S,hd)
-        k = self.k_proj(x).view(B, S, H, hd).transpose(1, 2)
-        v = self.v_proj(x).view(B, S, H, hd).transpose(1, 2)
-
-        scores = torch.matmul(q, k.transpose(-1, -2)) / (hd ** 0.5)  # (B,H,S,S)
-
-        # Causal mask
-        causal = torch.triu(torch.ones(S, S, device=x.device, dtype=torch.bool), 1)
-        scores = scores.masked_fill(causal, float("-inf"))
-
-        if attn_mask is not None:
-            # attn_mask here is already (B,1,1,S)
-            # expand over heads: (B,1,1,S) -> (B,H,S,S) via broadcast on last dim
-            mask = attn_mask.to(torch.bool)  # (B,1,1,S)
-            scores = scores.masked_fill(~mask, float("-inf"))
-
-        scores = scores - scores.max(dim=-1, keepdim=True).values
-        attn = F.softmax(scores, dim=-1)
-        attn = self.attn_dropout(attn)
-
-        z = torch.matmul(attn, v)  # (B,H,S,hd)
-        z = z.transpose(1, 2).contiguous().view(B, S, D)
-        return self.out_proj(z)
-
 
 # ---------------- GQA Attention ----------------
 
@@ -104,42 +61,34 @@ class GQAttention(nn.Module):
         self.attn_dropout = nn.Dropout(attn_dropout)
 
     def forward(self, x, position_ids, attn_mask=None):
-        """
-        x: (B, S, D)
-        position_ids: (B, S)
-        attn_mask: (B, 1, S, S) or None, 1 = keep, 0 = mask
-        """
         B, S, D = x.shape
         H, H_kv, hd = self.n_heads, self.n_kv_heads, self.head_dim
 
-        q = self.q_proj(x).view(B, S, H, hd).transpose(1, 2)      # (B, H, S, hd)
-        k = self.k_proj(x).view(B, S, H_kv, hd).transpose(1, 2)   # (B, H_kv, S, hd)
-        v = self.v_proj(x).view(B, S, H_kv, hd).transpose(1, 2)   # (B, H_kv, S, hd)
+        q = self.q_proj(x).view(B, S, H, hd).transpose(1, 2)
+        k = self.k_proj(x).view(B, S, H_kv, hd).transpose(1, 2)
+        v = self.v_proj(x).view(B, S, H_kv, hd).transpose(1, 2)
 
-        # Apply RoPE to q and k
-        q = apply_rope(q, position_ids)                           # (B, H, S, hd)
-        k = apply_rope(k, position_ids)                           # (B, H_kv, S, hd)
+        q = apply_rope(q, position_ids)
+        k = apply_rope(k, position_ids)
 
-        # Grouped‑query: expand kv heads if needed
         if H_kv != H:
-            k = k.repeat_interleave(H // H_kv, dim=1)             # (B, H, S, hd)
-            v = v.repeat_interleave(H // H_kv, dim=1)             # (B, H, S, hd)
+            k = k.repeat_interleave(H // H_kv, dim=1)
+            v = v.repeat_interleave(H // H_kv, dim=1)
 
-        scores = torch.matmul(q, k.transpose(-1, -2)) / (hd ** 0.5)  # (B, H, S, S)
+        scores = torch.matmul(q, k.transpose(-1, -2)) / (hd ** 0.5)
 
-        # Causal mask
         causal = torch.triu(torch.ones(S, S, device=x.device, dtype=torch.bool), 1)
         scores = scores.masked_fill(causal, float("-inf"))
 
-        # Optional attention mask (e.g., padding) in {0,1}
         if attn_mask is not None:
             scores = scores.masked_fill(attn_mask == 0, float("-inf"))
 
+        scores = scores - scores.max(dim=-1, keepdim=True).values
         attn = F.softmax(scores, dim=-1)
         attn = self.attn_dropout(attn)
 
-        z = torch.matmul(attn, v)                                 # (B, H, S, hd)
-        z = z.transpose(1, 2).contiguous().view(B, S, D)          # (B, S, D)
+        z = torch.matmul(attn, v)
+        z = z.transpose(1, 2).contiguous().view(B, S, D)
         return self.out_proj(z)
 
 # ---------------- SwiGLU MLP ----------------
@@ -155,20 +104,6 @@ class LlamaMLP(nn.Module):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 # ---------------- Transformer Block ----------------
-
-# class LlamaBlock(nn.Module):
-#     def __init__(self, d_model, ffn_dim, n_heads, n_kv_heads, attn_dropout=0.0):
-#         super().__init__()
-#         self.norm1 = RMSNorm(d_model)
-#         self.attn = SimpleMHA(d_model, n_heads, attn_dropout=attn_dropout)
-#         self.norm2 = RMSNorm(d_model)
-#         self.ffn = LlamaMLP(d_model, ffn_dim, use_bias=False)
-
-#     def forward(self, x, position_ids, attn_mask=None):
-#         # position_ids unused in this simple version
-#         x = x + self.attn(self.norm1(x), attn_mask)
-#         x = x + self.ffn(self.norm2(x))
-#         return x
 
 class LlamaBlock(nn.Module):
     def __init__(self, d_model, ffn_dim, n_heads, n_kv_heads, attn_dropout=0.0):
@@ -188,13 +123,13 @@ class LlamaBlock(nn.Module):
 class Llama3_1B(nn.Module):
     def __init__(
         self,
-        vocab_size=128256,   # Llama‑3.2 vocab is ~128k[web:33][web:59]
+        vocab_size,
         n_layers=16,
-        d_model=2048,        # 1B: 2048 hidden[web:35]
-        n_heads=32,          # 32 attention heads[web:35]
-        n_kv_heads=8,        # 8 KV heads (GQA)[web:35]
-        ffn_dim=8192,        # 8192 intermediate[web:35]
-        max_seq_len=8192,
+        d_model=2048,
+        n_heads=32,
+        n_kv_heads=8,
+        ffn_dim=8192,
+        max_seq_len=256,
         attn_dropout=0.0,
     ):
         super().__init__()
@@ -209,25 +144,15 @@ class Llama3_1B(nn.Module):
         ])
         self.norm = RMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
-
-        # Optionally tie weights (common in Llama‑style models)
         self.lm_head.weight = self.token_emb.weight
 
     def forward(self, input_ids, attention_mask=None):
-        """
-        input_ids: (B, S)
-        attention_mask: (B, S) in {0,1} or None
-        """
         B, S = input_ids.shape
         device = input_ids.device
 
-        # (B, S, D)
         x = self.token_emb(input_ids)
-
-        # position_ids: (B, S)
         pos = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
 
-        # HF‑style attn_mask: (B, 1, 1, S) or (B, 1, S, S); here we keep (B, 1, 1, S)
         attn_mask_4d = None
         if attention_mask is not None:
             attn_mask_4d = attention_mask[:, None, None, :]
@@ -236,40 +161,107 @@ class Llama3_1B(nn.Module):
             x = layer(x, pos, attn_mask_4d)
 
         x = self.norm(x)
-        logits = self.lm_head(x)  # (B, S, vocab_size)
-        return logits
+        return self.lm_head(x)
+
+# ---------------- Validation helper ----------------
+
+def evaluate(model, dev_loader, ce_loss, device):
+    model.eval()
+    total_loss = 0.0
+    total_tokens = 0
+
+    with torch.no_grad():
+        for batch in dev_loader:
+            input_ids = batch["input_ids"].to(device)
+            labels = batch["labels"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+
+            logits = model(input_ids, attention_mask=attention_mask)
+            B, S, V = logits.shape
+            loss = ce_loss(
+                logits.reshape(B * S, V),
+                labels.reshape(B * S),
+            )
+
+            valid = (labels != ce_loss.ignore_index).sum().item()
+            total_loss += loss.item() * valid
+            total_tokens += valid
+
+    model.train()
+    mean_loss = total_loss / max(1, total_tokens)
+    ppl = math.exp(mean_loss)
+    return mean_loss, ppl
+
+# ---------------- TRAINING & EMBEDDING INIT ----------------
 
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    tokenizer, train_loader = get_alpaca_dataloader(
-        model_name="distilbert-base-uncased",
+    # Build full Alpaca dataset (same preprocessing as your other scripts)
+    alpaca_tok = get_alpaca_tokenizer("distilbert-base-uncased")
+    full_dataset = build_alpaca_dataset(
+        alpaca_tok,
         max_len=256,
-        batch_size=4,
-        shuffle=True,
         mask_prompt=True,
     )
 
-    batch = next(iter(train_loader))
-    print("labels[0][:40]:", batch["labels"][0][:40])
-    print("unique labels:", torch.unique(batch["labels"]))
+    # Split into train/dev
+    VAL_FRAC = 0.05
+    n_total = len(full_dataset)
+    n_dev = int(VAL_FRAC * n_total)
+    n_train = n_total - n_dev
+    train_ds, dev_ds = random_split(
+        full_dataset,
+        [n_train, n_dev],
+        generator=torch.Generator().manual_seed(42),
+    )
+
+    train_loader = DataLoader(train_ds, batch_size=4, shuffle=True)
+    dev_loader   = DataLoader(dev_ds,   batch_size=4, shuffle=False)
+
+    batch0 = next(iter(train_loader))
+    print("labels[0][:40]:", batch0["labels"][0][:40])
+    print("unique labels:", torch.unique(batch0["labels"]))
     print("ignore_index in CE:", -100)
 
-    vocab_size = tokenizer.vocab_size
+    vocab_size = alpaca_tok.vocab_size
+
+    # Load pretrained DistilBERT embeddings
+    base_model = AutoModel.from_pretrained("distilbert-base-uncased").to(device)
+    pretrained_emb = base_model.embeddings.word_embeddings.weight.detach().cpu()
+    d_pre = pretrained_emb.shape[1]  # 768
+
+    d_model = 2048
+    n_layers = 16
+    n_heads = 32
+    n_kv_heads = 8
+    ffn_dim = 8192
 
     model = Llama3_1B(
         vocab_size=vocab_size,
-        d_model=2048,
-        n_heads=32,
-        n_kv_heads=8,
-        ffn_dim=8192,
-        n_layers=16,
+        d_model=d_model,
+        n_heads=n_heads,
+        n_kv_heads=n_kv_heads,
+        ffn_dim=ffn_dim,
+        n_layers=n_layers,
         max_seq_len=256,
     ).to(device)
 
-    base_lr = 3e-5          # a bit lower to be safe on big random model
-    total_steps = 10000     # more training
-    warmup_steps = 1000
+    # Init token embeddings from DistilBERT in first 768 dims
+    with torch.no_grad():
+        token_w = model.token_emb.weight.data  # (vocab, 2048)
+        n = min(vocab_size, pretrained_emb.shape[0])
+        token_w[:n, :d_pre].copy_(pretrained_emb[:n])
+
+    # Re-tie lm_head
+    with torch.no_grad():
+        model.lm_head.weight.data.copy_(model.token_emb.weight.data)
+
+    base_lr = 3e-5
+    total_steps = 3000
+    warmup_steps = 300
+    VAL_EVERY = 100
+    ACCUM_STEPS = 4
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=0.01)
     ce_loss = nn.CrossEntropyLoss(ignore_index=-100)
@@ -277,29 +269,14 @@ def main():
     def get_lr(step):
         if step < warmup_steps:
             return base_lr * float(step + 1) / warmup_steps
-        # cosine decay to 10% of base_lr
         progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
         return base_lr * (0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress)))
 
-    # synthetic sanity check (unchanged)
-    B_syn, S_syn = 2, 10
-    tokens = torch.randint(0, vocab_size, (B_syn, S_syn + 1), device=device)
-    input_ids_syn = tokens[:, :-1]
-    labels_syn    = tokens[:, 1:]
-    attn_syn      = torch.ones_like(input_ids_syn)
+    step = 0          # counts optimizer steps
+    optimizer.zero_grad()
 
-    with torch.no_grad():
-        logits_syn = model(input_ids_syn, attention_mask=attn_syn)
-        Bf, Sf, V = logits_syn.shape
-        syn_loss = ce_loss(
-            logits_syn.reshape(Bf * Sf, V),
-            labels_syn.reshape(Bf * Sf),
-        )
-        print("Synthetic loss:", syn_loss.item())
-
-    step = 0
     for epoch in range(1000):
-        for batch in train_loader:
+        for batch_idx, batch in enumerate(train_loader):
             if step >= total_steps:
                 break
 
@@ -307,7 +284,6 @@ def main():
             labels = batch["labels"].to(device)
             attention_mask = batch["attention_mask"].to(device)
 
-            # update LR from warmup+cosine schedule
             lr = get_lr(step)
             for g in optimizer.param_groups:
                 g["lr"] = lr
@@ -319,39 +295,55 @@ def main():
                 labels.reshape(B * S),
             )
 
-            optimizer.zero_grad()
+            # gradient accumulation
+            loss = loss / ACCUM_STEPS
             loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
 
-            mem_alloc = mem_peak = mem_reserved = 0.0
-            if torch.cuda.is_available():
-                mem_alloc = torch.cuda.memory_allocated() / 1e6
-                mem_peak = torch.cuda.max_memory_allocated() / 1e6
-                mem_reserved = torch.cuda.memory_reserved() / 1e6
+            if (batch_idx + 1) % ACCUM_STEPS == 0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad()
 
-            wandb.log({
-                "loss": loss.item(),
-                "learning_rate": lr,
-                "grad_norm": float(grad_norm),
-                "mem_allocated_MB": mem_alloc,
-                "mem_peak_MB": mem_peak,
-                "mem_reserved_MB": mem_reserved,
-                "step": step,
-            })
+                mem_alloc = mem_peak = mem_reserved = 0.0
+                if torch.cuda.is_available():
+                    mem_alloc = torch.cuda.memory_allocated() / 1e6
+                    mem_peak = torch.cuda.max_memory_allocated() / 1e6
+                    mem_reserved = torch.cuda.memory_reserved() / 1e6
 
-            print(
-                f"step={step:04d} | loss={loss.item():.6f} | lr={lr:.2e} | "
-                f"grad_norm={float(grad_norm):.2f} | "
-                f"mem_alloc={mem_alloc:.1f}MB mem_peak={mem_peak:.1f}MB "
-                f"mem_reserved={mem_reserved:.1f}MB"
-            )
+                # undo scaling for logging
+                true_loss = float(loss.item() * ACCUM_STEPS)
+                wandb.log({
+                    "loss": true_loss,
+                    "learning_rate": lr,
+                    "grad_norm": float(grad_norm),
+                    "mem_allocated_MB": mem_alloc,
+                    "mem_peak_MB": mem_peak,
+                    "mem_reserved_MB": mem_reserved,
+                    "step": step,
+                })
 
-            step += 1
+                if step % VAL_EVERY == 0 and step > 0:
+                    val_loss, val_ppl = evaluate(model, dev_loader, ce_loss, device)
+                    wandb.log({
+                        "val_loss": val_loss,
+                        "val_perplexity": val_ppl,
+                        "step": step,
+                    })
+                    print(f"[VAL] step={step:04d} | val_loss={val_loss:.6f} | val_ppl={val_ppl:.2f}")
+
+                print(
+                    f"step={step:04d} | loss={true_loss:.6f} | lr={lr:.2e} | "
+                    f"grad_norm={float(grad_norm):.2f} | "
+                    f"mem_alloc={mem_alloc:.1f}MB mem_peak={mem_peak:.1f}MB "
+                    f"mem_reserved={mem_reserved:.1f}MB"
+                )
+
+                step += 1
+
         if step >= total_steps:
             break
 
-    print("DONE. Check W&B dashboard for Alpaca training curves.")
+    print("DONE. Check W&B for train and val curves for baseline Llama3_1B.")
 
 if __name__ == "__main__":
     main()

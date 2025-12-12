@@ -3,8 +3,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import wandb
+from torch.utils.data import random_split, DataLoader
 from transformers import AutoTokenizer
-from alpaca_dataset import get_alpaca_dataloader
+from alpaca_dataset import get_alpaca_dataloader, build_alpaca_dataset, get_alpaca_tokenizer
 
 wandb.init(project="lowrank_model_llama32_like")
 
@@ -23,16 +24,13 @@ class RMSNorm(nn.Module):
 # ---------------- RoPE (MHA-style) ----------------
 
 def apply_rope(x, seq_dim=2, rope_theta=10000):
-    """
-    x: (B, H, S, hd) with seq_dim = 2
-    """
     b, h, s, hd = x.shape
     device, dtype = x.device, x.dtype
-    pos = torch.arange(s, device=device, dtype=dtype)           # (S,)
+    pos = torch.arange(s, device=device, dtype=dtype)
     inv = 1.0 / (rope_theta ** (torch.arange(0, hd, 2, device=device, dtype=dtype) / hd))
-    freqs = torch.outer(pos, inv)                               # (S, hd/2)
+    freqs = torch.outer(pos, inv)
     sin, cos = freqs.sin(), freqs.cos()
-    sin = sin.unsqueeze(0).unsqueeze(0)                         # (1,1,S,hd/2)
+    sin = sin.unsqueeze(0).unsqueeze(0)
     cos = cos.unsqueeze(0).unsqueeze(0)
 
     x1 = x[..., ::2]
@@ -43,20 +41,19 @@ def apply_rope(x, seq_dim=2, rope_theta=10000):
     x_rope[..., 1::2] = x2 * cos + x1 * sin
     return x_rope
 
-# ---------------- Low-rank embedding (trainable Vk, 2048 -> k) ----------------
+# ---------------- Low-rank embedding ----------------
 
 class LowRankEmbedding(nn.Module):
     def __init__(self, vocab_size, d_model, k, Vk_init):
         super().__init__()
-        self.embed = nn.Embedding(vocab_size, d_model)  # 2048-dim embedding
-        # Vk_init: (d_model, k) from PCA; make it trainable
-        self.Vk = nn.Parameter(Vk_init)                 # (2048, k), trainable
+        self.embed = nn.Embedding(vocab_size, d_model)
+        self.Vk = nn.Parameter(Vk_init)
 
     def forward(self, input_ids):
-        x = self.embed(input_ids)      # (B, S, d_model)
-        return x @ self.Vk             # (B, S, k)
+        x = self.embed(input_ids)
+        return x @ self.Vk
 
-# ---------------- GQA Attention in low-rank space ----------------
+# ---------------- GQA Attention ----------------
 
 class GQAttention_LR(nn.Module):
     def __init__(self, k, n_heads, n_kv_heads, attn_dropout=0.0):
@@ -72,16 +69,12 @@ class GQAttention_LR(nn.Module):
         self.attn_dropout = nn.Dropout(attn_dropout)
 
     def forward(self, x, attention_mask=None):
-        """
-        x: (B, S, K)
-        attention_mask: (B, S) or None
-        """
         B, S, K = x.shape
         H, H_kv, hd = self.n_heads, self.n_kv_heads, self.head_dim
 
-        q = self.q_proj(x).view(B, S, H, hd).transpose(1, 2)      # (B, H, S, hd)
-        k = self.k_proj(x).view(B, S, H_kv, hd).transpose(1, 2)   # (B, H_kv, S, hd)
-        v = self.v_proj(x).view(B, S, H_kv, hd).transpose(1, 2)   # (B, H_kv, S, hd)
+        q = self.q_proj(x).view(B, S, H, hd).transpose(1, 2)
+        k = self.k_proj(x).view(B, S, H_kv, hd).transpose(1, 2)
+        v = self.v_proj(x).view(B, S, H_kv, hd).transpose(1, 2)
 
         q = apply_rope(q)
         k = apply_rope(k)
@@ -90,13 +83,11 @@ class GQAttention_LR(nn.Module):
             k = k.repeat_interleave(H // H_kv, dim=1)
             v = v.repeat_interleave(H // H_kv, dim=1)
 
-        scores = torch.matmul(q, k.transpose(-1, -2)) / (hd ** 0.5)  # (B,H,S,S)
+        scores = torch.matmul(q, k.transpose(-1, -2)) / (hd ** 0.5)
 
-        # causal mask
         causal = torch.triu(torch.ones(S, S, device=x.device, dtype=torch.bool), 1)
         scores = scores.masked_fill(causal, float("-inf"))
 
-        # padding mask: attention_mask (B,S) -> (B,1,1,S)
         if attention_mask is not None:
             pad = attention_mask[:, None, None, :].to(torch.bool)
             scores = scores.masked_fill(~pad, float("-inf"))
@@ -105,8 +96,8 @@ class GQAttention_LR(nn.Module):
         attn = F.softmax(scores, dim=-1)
         attn = self.attn_dropout(attn)
 
-        z = torch.matmul(attn, v)                                # (B,H,S,hd)
-        z = z.transpose(1, 2).contiguous().view(B, S, K)         # (B,S,K)
+        z = torch.matmul(attn, v)
+        z = z.transpose(1, 2).contiguous().view(B, S, K)
         return self.out_proj(z)
 
 # ---------------- FFN ----------------
@@ -128,14 +119,14 @@ class LlamaBlock_LR(nn.Module):
         x = x + self.ffn(self.norm2(x))
         return x
 
-# ---------------- Low-rank Llama-1B-like model ----------------
+# ---------------- Model ----------------
 
 class Llama3_1B_LowRank(nn.Module):
     def __init__(
         self,
         vocab_size,
         d_model=2048,
-        k=384,
+        k=512,
         Vk_init=None,
         n_layers=16,
         n_heads=32,
@@ -159,25 +150,60 @@ class Llama3_1B_LowRank(nn.Module):
         self.lm_head = nn.Linear(k, vocab_size, bias=False)
 
     def forward(self, input_ids, attention_mask=None):
-        x = self.embed(input_ids)          # (B,S,k)
+        x = self.embed(input_ids)
         for layer in self.layers:
-            x = layer(x, attention_mask)   # (B,S,k)
+            x = layer(x, attention_mask)
         x = self.norm(x)
-        return self.lm_head(x)             # (B,S,vocab)
+        return self.lm_head(x)
 
-# ---------------- TRAINING on Alpaca with semantic PCA Vk ----------------
+# ---------------- Validation helper ----------------
+
+def evaluate(model, dev_loader, ce_loss, device):
+    model.eval()
+    total_loss = 0.0
+    total_tokens = 0
+
+    with torch.no_grad():
+        for batch in dev_loader:
+            input_ids = batch["input_ids"].to(device)
+            labels = batch["labels"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+
+            logits = model(input_ids, attention_mask=attention_mask)
+            B, S, Vocab = logits.shape
+            loss = ce_loss(
+                logits.reshape(B * S, Vocab),
+                labels.reshape(B * S),
+            )
+
+            valid = (labels != ce_loss.ignore_index).sum().item()
+            total_loss += loss.item() * valid
+            total_tokens += valid
+
+    model.train()
+    return total_loss / max(1, total_tokens)
+
+# ---------------- TRAINING ----------------
 
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Alpaca dataloader (same interface as your baseline)
-    tokenizer, train_loader = get_alpaca_dataloader(
-        model_name="distilbert-base-uncased",
+    # tokenizer + full Alpaca dataset
+    tokenizer = get_alpaca_tokenizer("distilbert-base-uncased")
+    full_dataset = build_alpaca_dataset(
+        tokenizer,
         max_len=256,
-        batch_size=4,
-        shuffle=True,
         mask_prompt=True,
     )
+
+    # split into train/dev
+    n_total = len(full_dataset)
+    n_dev = int(0.05 * n_total)
+    n_train = n_total - n_dev
+    train_ds, dev_ds = random_split(full_dataset, [n_train, n_dev])
+
+    train_loader = DataLoader(train_ds, batch_size=8, shuffle=True)
+    dev_loader   = DataLoader(dev_ds,   batch_size=8, shuffle=False)
 
     batch0 = next(iter(train_loader))
     print("labels[0][:40]:", batch0["labels"][0][:40])
@@ -186,33 +212,31 @@ def main():
 
     vocab_size = tokenizer.vocab_size
 
+
     d_model = 2048
-    k = 384
+    k = 512
     n_layers = 16
     n_heads = 32
     n_kv_heads = 8
     ffn_dim = 8192
 
-    # ---- Step 1: semantic PCA init for Vk using this model's own 2048-d embeddings ----
-    # Build a temporary 2048-d embedding to collect activations
+    # PCA init
     embed_tmp = nn.Embedding(vocab_size, d_model).to(device)
-
+    PCA_BATCH_LIMIT = 100
     acts = []
     with torch.no_grad():
         for i, batch in enumerate(train_loader):
-            if i >= 200:   # limit for speed; increase for better PCA
+            if i >= PCA_BATCH_LIMIT:
                 break
-            ids = batch["input_ids"].to(device)         # (B,S)
-            a = embed_tmp(ids).reshape(-1, d_model).cpu()  # (B*S, d_model)
+            ids = batch["input_ids"].to(device)
+            a = embed_tmp(ids).reshape(-1, d_model).cpu()
             acts.append(a)
-    acts = torch.cat(acts, dim=0)                       # (N, d_model)
+    acts = torch.cat(acts, dim=0)
     print("PCA source acts shape:", acts.shape)
 
-    # PCA to get top-k basis directions in 2048-d space
-    U, S, V = torch.pca_lowrank(acts, q=k, center=True)  # V: (d_model, d_model)[web:258]
-    Vk_init = V[:, :k].contiguous()                      # (d_model, k) = (2048, k)
+    U, S, V = torch.pca_lowrank(acts, q=k, center=True)
+    Vk_init = V[:, :k].contiguous()
 
-    # ---- Step 2: build low-rank Llama-1B-like model with trainable Vk_init ----
     model = Llama3_1B_LowRank(
         vocab_size=vocab_size,
         d_model=d_model,
@@ -225,10 +249,11 @@ def main():
         attn_dropout=0.0,
     ).to(device)
 
-    # Everything in model.parameters(), including Vk, is trainable
-    base_lr = 3e-5
-    total_steps = 5000
-    warmup_steps = 500
+    base_lr = 2e-4 
+    total_steps = 3000
+    warmup_steps = 300
+    VAL_EVERY = 100
+    ACCUM_STEPS = 4   
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=0.01)
     ce_loss = nn.CrossEntropyLoss(ignore_index=-100)
@@ -239,9 +264,10 @@ def main():
         progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
         return base_lr * (0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress)))
 
-    step = 0
+    step = 0          # counts optimizer steps
+    optimizer.zero_grad()
     for epoch in range(1000):
-        for batch in train_loader:
+        for batch_idx, batch in enumerate(train_loader):
             if step >= total_steps:
                 break
 
@@ -249,50 +275,62 @@ def main():
             labels = batch["labels"].to(device)
             attention_mask = batch["attention_mask"].to(device)
 
+            # learning rate based on optimizer step
             lr = get_lr(step)
             for g in optimizer.param_groups:
                 g["lr"] = lr
 
-            logits = model(input_ids, attention_mask=attention_mask)  # (B,S,V)
+            logits = model(input_ids, attention_mask=attention_mask)
             B, S, Vocab = logits.shape
             loss = ce_loss(
                 logits.reshape(B * S, Vocab),
                 labels.reshape(B * S),
             )
 
-            optimizer.zero_grad()
+            loss = loss / ACCUM_STEPS          # scale for accumulation
             loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
 
-            mem_alloc = mem_peak = mem_reserved = 0.0
-            if torch.cuda.is_available():
-                mem_alloc = torch.cuda.memory_allocated() / 1e6
-                mem_peak = torch.cuda.max_memory_allocated() / 1e6
-                mem_reserved = torch.cuda.memory_reserved() / 1e6
+            # only update every ACCUM_STEPS mini-batches
+            if (batch_idx + 1) % ACCUM_STEPS == 0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad()
 
-            wandb.log({
-                "loss": float(loss.item()),
-                "learning_rate": lr,
-                "grad_norm": float(grad_norm),
-                "mem_allocated_MB": mem_alloc,
-                "mem_peak_MB": mem_peak,
-                "mem_reserved_MB": mem_reserved,
-                "step": step,
-            })
+                mem_alloc = mem_peak = mem_reserved = 0.0
+                if torch.cuda.is_available():
+                    mem_alloc = torch.cuda.memory_allocated() / 1e6
+                    mem_peak = torch.cuda.max_memory_allocated() / 1e6
+                    mem_reserved = torch.cuda.memory_reserved() / 1e6
 
-            print(
-                f"step={step:04d} | loss={loss.item():.6f} | lr={lr:.2e} | "
-                f"grad_norm={float(grad_norm):.2f} | "
-                f"mem_alloc={mem_alloc:.1f}MB mem_peak={mem_peak:.1f}MB "
-                f"mem_reserved={mem_reserved:.1f}MB"
-            )
+                wandb.log({
+                    "loss": float(loss.item() * ACCUM_STEPS),  # undo scaling for logging
+                    "learning_rate": lr,
+                    "grad_norm": float(grad_norm),
+                    "mem_allocated_MB": mem_alloc,
+                    "mem_peak_MB": mem_peak,
+                    "mem_reserved_MB": mem_reserved,
+                    "step": step,
+                })
 
-            step += 1
+                if step % VAL_EVERY == 0 and step > 0:
+                    val_loss = evaluate(model, dev_loader, ce_loss, device)
+                    wandb.log({"val_loss": val_loss, "step": step})
+                    print(f"[VAL] step={step:04d} | val_loss={val_loss:.6f}")
+
+                print(
+                    f"step={step:04d} | loss={(loss.item()*ACCUM_STEPS):.6f} | lr={lr:.2e} | "
+                    f"grad_norm={float(grad_norm):.2f} | "
+                    f"mem_alloc={mem_alloc:.1f}MB mem_peak={mem_peak:.1f}MB "
+                    f"mem_reserved={mem_reserved:.1f}MB"
+                )
+
+                step += 1
+
         if step >= total_steps:
             break
 
-    print("DONE. Check W&B dashboard for low-rank Alpaca training curves.")
+
+    print("DONE. Check W&B for train and val curves.")
 
 if __name__ == "__main__":
     main()

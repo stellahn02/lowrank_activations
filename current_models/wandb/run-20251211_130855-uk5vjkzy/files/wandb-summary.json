@@ -1,0 +1,1 @@
+{"mem_allocated_MB":16979.964928,"_timestamp":1.765476675137479e+09,"_wandb":{"runtime":138},"_runtime":138,"_step":355,"mem_peak_MB":21171.2768,"step":355,"learning_rate":2.1360000000000002e-05,"grad_norm":4.6753716468811035,"mem_reserved_MB":23471.325184,"loss":1.2851094007492065}

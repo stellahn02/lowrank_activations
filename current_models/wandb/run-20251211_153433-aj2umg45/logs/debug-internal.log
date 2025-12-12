@@ -1,0 +1,6 @@
+{"time":"2025-12-11T15:34:33.297483222-05:00","level":"INFO","msg":"stream: starting","core version":"0.22.3"}
+{"time":"2025-12-11T15:34:33.5188215-05:00","level":"INFO","msg":"stream: created new stream","id":"aj2umg45"}
+{"time":"2025-12-11T15:34:33.518865723-05:00","level":"INFO","msg":"handler: started","stream_id":"aj2umg45"}
+{"time":"2025-12-11T15:34:33.519511845-05:00","level":"INFO","msg":"stream: started","id":"aj2umg45"}
+{"time":"2025-12-11T15:34:33.519520013-05:00","level":"INFO","msg":"writer: started","stream_id":"aj2umg45"}
+{"time":"2025-12-11T15:34:33.519525978-05:00","level":"INFO","msg":"sender: started","stream_id":"aj2umg45"}

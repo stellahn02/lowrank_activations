@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "/orcd/home/002/hyewona/lr-act/current_models/lowrank_model_v2.py", line 327, in <module>
+    main()
+    ~~~~^^
+  File "/orcd/home/002/hyewona/lr-act/current_models/lowrank_model_v2.py", line 192, in main
+    tokenizer = get_alpaca_tokenizer("distilbert-base-uncased")
+                ^^^^^^^^^^^^^^^^^^^^
+NameError: name 'get_alpaca_tokenizer' is not defined
