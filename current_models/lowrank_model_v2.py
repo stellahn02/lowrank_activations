@@ -4,10 +4,24 @@ import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 from torch.utils.data import random_split, DataLoader
-from transformers import AutoTokenizer
-from alpaca_dataset import get_alpaca_dataloader, build_alpaca_dataset, get_alpaca_tokenizer
 
-wandb.init(project="lowrank_model_llama32_like")
+from transformers import AutoModel, LlamaConfig
+from alpaca_dataset import build_alpaca_dataset, get_alpaca_tokenizer
+
+
+PROJECT_NAME = "lowrank_llama32_1b_like_sdpa_bf16"
+MODEL_ID = "meta-llama/Llama-3.2-1B-Instruct"
+
+MAX_LEN = 256
+TRAIN_BATCH_SIZE = 4
+VAL_FRAC = 0.05
+
+BASE_LR = 3e-5
+TOTAL_STEPS = 3000
+WARMUP_STEPS = 300
+VAL_EVERY = 100
+ACCUM_STEPS = 4
+
 
 # ---------------- RMSNorm ----------------
 
@@ -18,20 +32,25 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x):
-        norm = x.norm(dim=-1, keepdim=True) / (x.shape[-1] ** 0.5)
-        return self.weight * x / (norm + self.eps)
+        norm = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
+        return self.weight * x * norm
 
-# ---------------- RoPE (MHA-style) ----------------
 
-def apply_rope(x, seq_dim=2, rope_theta=10000):
+# ---------------- RoPE (baseline-style) ----------------
+
+def apply_rope(x, position_ids, rope_theta):
+    """
+    x: (B, H, S, hd)
+    position_ids: (B, S)
+    """
     b, h, s, hd = x.shape
     device, dtype = x.device, x.dtype
-    pos = torch.arange(s, device=device, dtype=dtype)
-    inv = 1.0 / (rope_theta ** (torch.arange(0, hd, 2, device=device, dtype=dtype) / hd))
-    freqs = torch.outer(pos, inv)
+
+    inv_freq = 1.0 / (rope_theta ** (torch.arange(0, hd, 2, device=device, dtype=dtype) / hd))
+    freqs = torch.einsum("bs,d->bsd", position_ids.to(dtype), inv_freq)
     sin, cos = freqs.sin(), freqs.cos()
-    sin = sin.unsqueeze(0).unsqueeze(0)
-    cos = cos.unsqueeze(0).unsqueeze(0)
+    sin = sin.unsqueeze(1)   # (B,1,S,hd/2)
+    cos = cos.unsqueeze(1)
 
     x1 = x[..., ::2]
     x2 = x[..., 1::2]
@@ -41,120 +60,160 @@ def apply_rope(x, seq_dim=2, rope_theta=10000):
     x_rope[..., 1::2] = x2 * cos + x1 * sin
     return x_rope
 
+
 # ---------------- Low-rank embedding ----------------
 
 class LowRankEmbedding(nn.Module):
     def __init__(self, vocab_size, d_model, k, Vk_init):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, d_model)
-        self.Vk = nn.Parameter(Vk_init)
+        self.Vk = nn.Parameter(Vk_init)  # (d_model, k)
 
     def forward(self, input_ids):
-        x = self.embed(input_ids)
-        return x @ self.Vk
+        x = self.embed(input_ids)   # (B,S,d_model)
+        return x @ self.Vk          # (B,S,k)
 
-# ---------------- GQA Attention ----------------
+
+# ---------------- GQA Attention (SDPA, low-rank) ----------------
 
 class GQAttention_LR(nn.Module):
-    def __init__(self, k, n_heads, n_kv_heads, attn_dropout=0.0):
+    def __init__(self, k, n_heads, n_kv_heads, rope_theta, attn_dropout=0.0):
         super().__init__()
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
         self.head_dim = k // n_heads
+        self.rope_theta = rope_theta
 
-        self.q_proj = nn.Linear(k, k, bias=False)
+        self.q_proj = nn.Linear(k, n_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(k, n_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(k, n_kv_heads * self.head_dim, bias=False)
         self.out_proj = nn.Linear(k, k, bias=False)
-        self.attn_dropout = nn.Dropout(attn_dropout)
+        self.attn_dropout = attn_dropout
 
-    def forward(self, x, attention_mask=None):
+    def forward(self, x, position_ids, attention_mask=None):
         B, S, K = x.shape
         H, H_kv, hd = self.n_heads, self.n_kv_heads, self.head_dim
 
-        q = self.q_proj(x).view(B, S, H, hd).transpose(1, 2)
-        k = self.k_proj(x).view(B, S, H_kv, hd).transpose(1, 2)
+        q = self.q_proj(x).view(B, S, H, hd).transpose(1, 2)     # (B,H,S,hd)
+        k = self.k_proj(x).view(B, S, H_kv, hd).transpose(1, 2)  # (B,H_kv,S,hd)
         v = self.v_proj(x).view(B, S, H_kv, hd).transpose(1, 2)
 
-        q = apply_rope(q)
-        k = apply_rope(k)
+        q = apply_rope(q, position_ids, self.rope_theta)
+        k = apply_rope(k, position_ids, self.rope_theta)
 
         if H_kv != H:
-            k = k.repeat_interleave(H // H_kv, dim=1)
-            v = v.repeat_interleave(H // H_kv, dim=1)
+            repeat = H // H_kv
+            k = k.repeat_interleave(repeat, dim=1)
+            v = v.repeat_interleave(repeat, dim=1)
 
-        scores = torch.matmul(q, k.transpose(-1, -2)) / (hd ** 0.5)
+        # reshape for SDPA: (B*H, S, hd)
+        q = q.reshape(B * H, S, hd)
+        k = k.reshape(B * H, S, hd)
+        v = v.reshape(B * H, S, hd)
 
-        causal = torch.triu(torch.ones(S, S, device=x.device, dtype=torch.bool), 1)
-        scores = scores.masked_fill(causal, float("-inf"))
-
-        if attention_mask is not None:
-            pad = attention_mask[:, None, None, :].to(torch.bool)
-            scores = scores.masked_fill(~pad, float("-inf"))
-
-        scores = scores - scores.max(dim=-1, keepdim=True).values
-        attn = F.softmax(scores, dim=-1)
-        attn = self.attn_dropout(attn)
-
-        z = torch.matmul(attn, v)
-        z = z.transpose(1, 2).contiguous().view(B, S, K)
-        return self.out_proj(z)
-
-# ---------------- FFN ----------------
-
-class LlamaBlock_LR(nn.Module):
-    def __init__(self, k, ffn_dim, n_heads, n_kv_heads, attn_dropout=0.0):
-        super().__init__()
-        self.norm1 = RMSNorm(k)
-        self.attn = GQAttention_LR(k, n_heads, n_kv_heads, attn_dropout=attn_dropout)
-        self.norm2 = RMSNorm(k)
-        self.ffn = nn.Sequential(
-            nn.Linear(k, ffn_dim),
-            nn.GELU(),
-            nn.Linear(ffn_dim, k),
+        # causal mask (S,S), True above diagonal
+        causal = torch.triu(
+            torch.ones(S, S, device=x.device, dtype=torch.bool),
+            diagonal=1,
         )
 
-    def forward(self, x, attention_mask=None):
-        x = x + self.attn(self.norm1(x), attention_mask)
+        if attention_mask is not None:
+            # attention_mask: (B,S), 1=keep, 0=pad
+            pad = (attention_mask == 0)  # True = pad
+            pad_4d = pad[:, None, None, :].expand(B, 1, S, S)
+            causal_4d = causal.view(1, 1, S, S)
+            full_mask = pad_4d | causal_4d  # (B,1,S,S)
+            attn_mask = full_mask.expand(B, H, S, S).reshape(B * H, S, S)
+        else:
+            attn_mask = causal.view(1, S, S).expand(B * H, S, S)
+
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            dropout_p=self.attn_dropout if self.training else 0.0,
+            is_causal=False,
+        )  # (B*H,S,hd)
+
+        attn_output = attn_output.reshape(B, H, S, hd).transpose(1, 2).reshape(B, S, K)
+        return self.out_proj(attn_output)
+
+
+# ---------------- SwiGLU MLP on k ----------------
+
+class LlamaMLP_LR(nn.Module):
+    def __init__(self, k, ffn_dim, use_bias=False):
+        super().__init__()
+        self.gate_proj = nn.Linear(k, ffn_dim, bias=use_bias)
+        self.up_proj   = nn.Linear(k, ffn_dim, bias=use_bias)
+        self.down_proj = nn.Linear(ffn_dim, k, bias=use_bias)
+
+    def forward(self, x):
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+# ---------------- Transformer Block (low-rank) ----------------
+
+class LlamaBlock_LR(nn.Module):
+    def __init__(self, k, ffn_dim, n_heads, n_kv_heads, rope_theta, attn_dropout=0.0):
+        super().__init__()
+        self.norm1 = RMSNorm(k)
+        self.attn = GQAttention_LR(k, n_heads, n_kv_heads, rope_theta, attn_dropout=attn_dropout)
+        self.norm2 = RMSNorm(k)
+        self.ffn = LlamaMLP_LR(k, ffn_dim, use_bias=False)
+
+    def forward(self, x, position_ids, attention_mask=None):
+        x = x + self.attn(self.norm1(x), position_ids, attention_mask)
         x = x + self.ffn(self.norm2(x))
         return x
 
-# ---------------- Model ----------------
+
+# ---------------- Llama‑3.2‑like 1B Low‑Rank ----------------
 
 class Llama3_1B_LowRank(nn.Module):
     def __init__(
         self,
         vocab_size,
-        d_model=2048,
-        k=512,
-        Vk_init=None,
-        n_layers=16,
-        n_heads=32,
-        n_kv_heads=8,
-        ffn_dim=8192,
+        n_layers,
+        d_model,
+        k,
+        n_heads,
+        n_kv_heads,
+        ffn_dim,
+        rope_theta,
+        Vk_init,
+        max_seq_len=256,
         attn_dropout=0.0,
     ):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.k = k
+        self.max_seq_len = max_seq_len
+        self.rope_theta = rope_theta
 
         assert Vk_init is not None and Vk_init.shape == (d_model, k)
-        self.embed = LowRankEmbedding(vocab_size, d_model, k, Vk_init=Vk_init)
 
+        self.embed = LowRankEmbedding(vocab_size, d_model, k, Vk_init=Vk_init)
         self.layers = nn.ModuleList([
-            LlamaBlock_LR(k, ffn_dim, n_heads, n_kv_heads, attn_dropout=attn_dropout)
+            LlamaBlock_LR(k, ffn_dim, n_heads, n_kv_heads, rope_theta, attn_dropout=attn_dropout)
             for _ in range(n_layers)
         ])
         self.norm = RMSNorm(k)
         self.lm_head = nn.Linear(k, vocab_size, bias=False)
 
     def forward(self, input_ids, attention_mask=None):
-        x = self.embed(input_ids)
+        B, S = input_ids.shape
+        device = input_ids.device
+
+        x = self.embed(input_ids)  # (B,S,k)
+        pos = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
+
         for layer in self.layers:
-            x = layer(x, attention_mask)
+            x = layer(x, pos, attention_mask)
+
         x = self.norm(x)
         return self.lm_head(x)
+
 
 # ---------------- Validation helper ----------------
 
@@ -169,58 +228,70 @@ def evaluate(model, dev_loader, ce_loss, device):
             labels = batch["labels"].to(device)
             attention_mask = batch["attention_mask"].to(device)
 
-            logits = model(input_ids, attention_mask=attention_mask)
-            B, S, Vocab = logits.shape
-            loss = ce_loss(
-                logits.reshape(B * S, Vocab),
-                labels.reshape(B * S),
-            )
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits = model(input_ids, attention_mask=attention_mask)
+                B, S, V = logits.shape
+                loss = ce_loss(
+                    logits.reshape(B * S, V),
+                    labels.reshape(B * S),
+                )
 
             valid = (labels != ce_loss.ignore_index).sum().item()
             total_loss += loss.item() * valid
             total_tokens += valid
 
     model.train()
-    return total_loss / max(1, total_tokens)
+    mean_loss = total_loss / max(1, total_tokens)
+    ppl = math.exp(mean_loss)
+    return mean_loss, ppl
 
-# ---------------- TRAINING ----------------
+
+# ---------------- TRAINING & PCA INIT ----------------
 
 def main():
+    wandb.init(project=PROJECT_NAME)
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # tokenizer + full Alpaca dataset
-    tokenizer = get_alpaca_tokenizer("distilbert-base-uncased")
+    # 1) Exact Llama‑3.2‑1B hyperparams from HF
+    hf_cfg = LlamaConfig.from_pretrained(MODEL_ID)
+    d_model    = hf_cfg.hidden_size
+    n_layers   = hf_cfg.num_hidden_layers
+    n_heads    = hf_cfg.num_attention_heads
+    n_kv_heads = hf_cfg.num_key_value_heads
+    ffn_dim    = hf_cfg.intermediate_size
+    rope_theta = hf_cfg.rope_theta
+
+    # 2) Build full Alpaca dataset
+    alpaca_tok = get_alpaca_tokenizer("distilbert-base-uncased")
     full_dataset = build_alpaca_dataset(
-        tokenizer,
-        max_len=256,
+        alpaca_tok,
+        max_len=MAX_LEN,
         mask_prompt=True,
     )
 
-    # split into train/dev
+    # 3) Split into train/dev
     n_total = len(full_dataset)
-    n_dev = int(0.05 * n_total)
+    n_dev = int(VAL_FRAC * n_total)
     n_train = n_total - n_dev
-    train_ds, dev_ds = random_split(full_dataset, [n_train, n_dev])
+    train_ds, dev_ds = random_split(
+        full_dataset,
+        [n_train, n_dev],
+        generator=torch.Generator().manual_seed(42),
+    )
 
-    train_loader = DataLoader(train_ds, batch_size=8, shuffle=True)
-    dev_loader   = DataLoader(dev_ds,   batch_size=8, shuffle=False)
+    train_loader = DataLoader(train_ds, batch_size=TRAIN_BATCH_SIZE, shuffle=True)
+    dev_loader   = DataLoader(dev_ds,   batch_size=TRAIN_BATCH_SIZE, shuffle=False)
 
     batch0 = next(iter(train_loader))
     print("labels[0][:40]:", batch0["labels"][0][:40])
     print("unique labels:", torch.unique(batch0["labels"]))
     print("ignore_index in CE:", -100)
 
-    vocab_size = tokenizer.vocab_size
+    vocab_size = alpaca_tok.vocab_size
 
-
-    d_model = 2048
-    k = 512
-    n_layers = 16
-    n_heads = 32
-    n_kv_heads = 8
-    ffn_dim = 8192
-
-    # PCA init
+    # 4) PCA init for Vk using a temporary embedding at d_model
+    k = 512  # low-rank dim (you can change this)
     embed_tmp = nn.Embedding(vocab_size, d_model).to(device)
     PCA_BATCH_LIMIT = 100
     acts = []
@@ -235,25 +306,27 @@ def main():
     print("PCA source acts shape:", acts.shape)
 
     U, S, V = torch.pca_lowrank(acts, q=k, center=True)
-    Vk_init = V[:, :k].contiguous()
+    Vk_init = V[:, :k].contiguous()  # (d_model, k)
 
+    # 5) Low‑rank Llama3_1B‑like with SDPA attention, bf16
     model = Llama3_1B_LowRank(
         vocab_size=vocab_size,
+        n_layers=n_layers,
         d_model=d_model,
         k=k,
-        Vk_init=Vk_init,
-        n_layers=n_layers,
         n_heads=n_heads,
         n_kv_heads=n_kv_heads,
         ffn_dim=ffn_dim,
+        rope_theta=rope_theta,
+        Vk_init=Vk_init,
+        max_seq_len=MAX_LEN,
         attn_dropout=0.0,
-    ).to(device)
+    ).to(device).to(torch.bfloat16)
 
-    base_lr = 2e-4 
-    total_steps = 3000
-    warmup_steps = 300
-    VAL_EVERY = 100
-    ACCUM_STEPS = 4   
+    # 6) Optimizer, LR schedule, accumulation, validation
+    base_lr = BASE_LR
+    total_steps = TOTAL_STEPS
+    warmup_steps = WARMUP_STEPS
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=0.01)
     ce_loss = nn.CrossEntropyLoss(ignore_index=-100)
@@ -264,8 +337,9 @@ def main():
         progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
         return base_lr * (0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress)))
 
-    step = 0          # counts optimizer steps
+    step = 0
     optimizer.zero_grad()
+
     for epoch in range(1000):
         for batch_idx, batch in enumerate(train_loader):
             if step >= total_steps:
@@ -275,22 +349,21 @@ def main():
             labels = batch["labels"].to(device)
             attention_mask = batch["attention_mask"].to(device)
 
-            # learning rate based on optimizer step
             lr = get_lr(step)
             for g in optimizer.param_groups:
                 g["lr"] = lr
 
-            logits = model(input_ids, attention_mask=attention_mask)
-            B, S, Vocab = logits.shape
-            loss = ce_loss(
-                logits.reshape(B * S, Vocab),
-                labels.reshape(B * S),
-            )
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits = model(input_ids, attention_mask=attention_mask)
+                B, S, V = logits.shape
+                loss = ce_loss(
+                    logits.reshape(B * S, V),
+                    labels.reshape(B * S),
+                )
 
-            loss = loss / ACCUM_STEPS          # scale for accumulation
+            loss = loss / ACCUM_STEPS
             loss.backward()
 
-            # only update every ACCUM_STEPS mini-batches
             if (batch_idx + 1) % ACCUM_STEPS == 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
@@ -302,8 +375,9 @@ def main():
                     mem_peak = torch.cuda.max_memory_allocated() / 1e6
                     mem_reserved = torch.cuda.memory_reserved() / 1e6
 
+                true_loss = float(loss.item() * ACCUM_STEPS)
                 wandb.log({
-                    "loss": float(loss.item() * ACCUM_STEPS),  # undo scaling for logging
+                    "loss": true_loss,
                     "learning_rate": lr,
                     "grad_norm": float(grad_norm),
                     "mem_allocated_MB": mem_alloc,
@@ -313,12 +387,16 @@ def main():
                 })
 
                 if step % VAL_EVERY == 0 and step > 0:
-                    val_loss = evaluate(model, dev_loader, ce_loss, device)
-                    wandb.log({"val_loss": val_loss, "step": step})
-                    print(f"[VAL] step={step:04d} | val_loss={val_loss:.6f}")
+                    val_loss, val_ppl = evaluate(model, dev_loader, ce_loss, device)
+                    wandb.log({
+                        "val_loss": val_loss,
+                        "val_perplexity": val_ppl,
+                        "step": step,
+                    })
+                    print(f"[VAL] step={step:04d} | val_loss={val_loss:.6f} | val_ppl={val_ppl:.2f}")
 
                 print(
-                    f"step={step:04d} | loss={(loss.item()*ACCUM_STEPS):.6f} | lr={lr:.2e} | "
+                    f"step={step:04d} | loss={true_loss:.6f} | lr={lr:.2e} | "
                     f"grad_norm={float(grad_norm):.2f} | "
                     f"mem_alloc={mem_alloc:.1f}MB mem_peak={mem_peak:.1f}MB "
                     f"mem_reserved={mem_reserved:.1f}MB"
@@ -329,8 +407,8 @@ def main():
         if step >= total_steps:
             break
 
+    print("DONE. Check W&B for train and val curves for low‑rank Llama3_1B.")
 
-    print("DONE. Check W&B for train and val curves.")
 
 if __name__ == "__main__":
     main()

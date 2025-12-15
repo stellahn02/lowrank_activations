@@ -11,13 +11,12 @@ from transformers import (
     get_cosine_schedule_with_warmup,
 )
 
-from alpaca_dataset import build_alpaca_dataset, get_alpaca_tokenizer
-
+from alpaca_dataset import build_alpaca_dataset
 
 # ---------------- CONFIG ----------------
 
-MODEL_ID = "meta-llama/Llama-3.2-1B-Instruct"
-PROJECT_NAME = "hf_llama32_with_val_alpaca"
+MODEL_ID = "meta-llama/Llama-3.2-1B"
+PROJECT_NAME = "hf_llama32_with_val_alpaca_llama_tok"
 
 BATCH_SIZE = 8
 STEPS = 3000
@@ -28,7 +27,6 @@ MAX_LEN = 256
 VAL_FRAC = 0.05
 VAL_EVERY = 100
 ACCUM_STEPS = 4   # gradient accumulation
-
 
 # ---------------- EVAL ----------------
 
@@ -60,7 +58,6 @@ def evaluate_hf(model, dev_loader, device):
     ppl = math.exp(mean_loss)
     return mean_loss, ppl
 
-
 # ---------------- MAIN ----------------
 
 def main():
@@ -68,15 +65,14 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # 1. Tokenizer & HF config
+    # 1. Llama tokenizer (used both for dataset and model)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, use_fast=False)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # 2. Full Alpaca dataset using your helper
-    alpaca_tok = get_alpaca_tokenizer("distilbert-base-uncased")
+    # 2. Build Alpaca dataset with Llama tokenizer
     full_dataset = build_alpaca_dataset(
-        alpaca_tok,
+        tokenizer,
         max_len=MAX_LEN,
         mask_prompt=True,
     )
@@ -190,8 +186,7 @@ def main():
         if step >= STEPS:
             break
 
-    print("DONE. Check W&B for HF train/val curves.")
-
+    print("DONE. Check W&B for HF train/val curves with Llama tokenizer.")
 
 if __name__ == "__main__":
     main()
