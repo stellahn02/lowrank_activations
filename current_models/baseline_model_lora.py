@@ -5,10 +5,11 @@ import torch.nn.functional as F
 import wandb
 from torch.utils.data import random_split, DataLoader
 
-from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM
-from alpaca_dataset import build_alpaca_dataset
+from transformers import AutoModel, LlamaConfig, LlamaForCausalLM, AutoTokenizer
+from alpaca_dataset import build_alpaca_dataset, get_alpaca_tokenizer
 
-PROJECT_NAME = "baseline_llama32_1b_like_sdpa_bf16_llama_tok"
+
+PROJECT_NAME = "baseline_llama32_1b_like_sdpa_bf16_lora_pt"
 MODEL_ID = "meta-llama/Llama-3.2-1B-Instruct"
 
 MAX_LEN = 256
@@ -21,6 +22,46 @@ WARMUP_STEPS = 300
 VAL_EVERY = 100
 ACCUM_STEPS = 4
 
+
+# ---------------- LoRA linear ----------------
+
+class LoRALinear(nn.Module):
+    def __init__(self, in_features, out_features, r=16, alpha=32, dropout=0.05, bias=False):
+        super().__init__()
+        self.r = r
+        self.scaling = alpha / r if r > 0 else 1.0
+
+        # base weight (FROZEN)
+        self.weight = nn.Parameter(torch.empty(out_features, in_features), requires_grad=False)
+        self.bias = nn.Parameter(torch.zeros(out_features), requires_grad=False) if bias else None
+
+        if r > 0:
+            self.lora_A = nn.Parameter(torch.zeros(r, in_features))          # trainable
+            self.lora_B = nn.Parameter(torch.zeros(out_features, r))         # trainable
+            self.lora_dropout = nn.Dropout(dropout)
+        else:
+            self.register_parameter("lora_A", None)
+            self.register_parameter("lora_B", None)
+            self.lora_dropout = nn.Identity()
+
+        # init base + LoRA
+        with torch.no_grad():
+            nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+            if r > 0:
+                nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+                nn.init.zeros_(self.lora_B)
+
+    def forward(self, x):
+        # base linear
+        out = F.linear(x, self.weight, self.bias)
+        # LoRA branch
+        if self.r > 0:
+            lora = F.linear(self.lora_dropout(x), self.lora_A)   # (.., r)
+            lora = F.linear(lora, self.lora_B)                   # (.., out)
+            out = out + self.scaling * lora
+        return out
+
+
 # ---------------- RMSNorm ----------------
 
 class RMSNorm(nn.Module):
@@ -32,6 +73,7 @@ class RMSNorm(nn.Module):
     def forward(self, x):
         norm = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
         return self.weight * x * norm
+
 
 # ---------------- RoPE ----------------
 
@@ -46,7 +88,7 @@ def apply_rope(x, position_ids, rope_theta):
     inv_freq = 1.0 / (rope_theta ** (torch.arange(0, hd, 2, device=device, dtype=dtype) / hd))
     freqs = torch.einsum("bs,d->bsd", position_ids.to(dtype), inv_freq)
     sin, cos = freqs.sin(), freqs.cos()
-    sin = sin.unsqueeze(1)
+    sin = sin.unsqueeze(1)   # (B,1,S,hd/2)
     cos = cos.unsqueeze(1)
 
     x1 = x[..., ::2]
@@ -57,20 +99,26 @@ def apply_rope(x, position_ids, rope_theta):
     x_rope[..., 1::2] = x2 * cos + x1 * sin
     return x_rope
 
-# ---------------- GQA Attention (SDPA) ----------------
+
+# ---------------- GQA Attention (SDPA + LoRA) ----------------
 
 class GQAttention(nn.Module):
-    def __init__(self, dim, n_heads, n_kv_heads, rope_theta, attn_dropout=0.0):
+    def __init__(self, dim, n_heads, n_kv_heads, rope_theta, attn_dropout=0.0,
+                 lora_r=16, lora_alpha=32, lora_dropout=0.05):
         super().__init__()
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
         self.head_dim = dim // n_heads
         self.rope_theta = rope_theta
 
-        self.q_proj = nn.Linear(dim, n_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(dim, n_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(dim, n_kv_heads * self.head_dim, bias=False)
-        self.out_proj = nn.Linear(dim, dim, bias=False)
+        self.q_proj = LoRALinear(dim, n_heads * self.head_dim,
+                                 r=lora_r, alpha=lora_alpha, dropout=lora_dropout, bias=False)
+        self.k_proj = LoRALinear(dim, n_kv_heads * self.head_dim,
+                                 r=lora_r, alpha=lora_alpha, dropout=lora_dropout, bias=False)
+        self.v_proj = LoRALinear(dim, n_kv_heads * self.head_dim,
+                                 r=lora_r, alpha=lora_alpha, dropout=lora_dropout, bias=False)
+        self.out_proj = LoRALinear(dim, dim,
+                                   r=lora_r, alpha=lora_alpha, dropout=lora_dropout, bias=False)
         self.attn_dropout = attn_dropout
 
     def forward(self, x, position_ids, attention_mask=None):
@@ -117,32 +165,47 @@ class GQAttention(nn.Module):
         attn_output = attn_output.reshape(B, H, S, hd).transpose(1, 2).reshape(B, S, D)
         return self.out_proj(attn_output)
 
-# ---------------- SwiGLU MLP ----------------
+
+# ---------------- SwiGLU MLP + LoRA ----------------
 
 class LlamaMLP(nn.Module):
-    def __init__(self, d_model, ffn_dim, use_bias=False):
+    def __init__(self, d_model, ffn_dim, use_bias=False,
+                 lora_r=16, lora_alpha=32, lora_dropout=0.05):
         super().__init__()
-        self.gate_proj = nn.Linear(d_model, ffn_dim, bias=use_bias)
-        self.up_proj   = nn.Linear(d_model, ffn_dim, bias=use_bias)
-        self.down_proj = nn.Linear(ffn_dim, d_model, bias=use_bias)
+        self.gate_proj = LoRALinear(d_model, ffn_dim,
+                                    r=lora_r, alpha=lora_alpha, dropout=lora_dropout, bias=use_bias)
+        self.up_proj   = LoRALinear(d_model, ffn_dim,
+                                    r=lora_r, alpha=lora_alpha, dropout=lora_dropout, bias=use_bias)
+        self.down_proj = LoRALinear(ffn_dim, d_model,
+                                    r=lora_r, alpha=lora_alpha, dropout=lora_dropout, bias=use_bias)
 
     def forward(self, x):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
+
 # ---------------- Transformer Block ----------------
 
 class LlamaBlock(nn.Module):
-    def __init__(self, d_model, ffn_dim, n_heads, n_kv_heads, rope_theta, attn_dropout=0.0):
+    def __init__(self, d_model, ffn_dim, n_heads, n_kv_heads, rope_theta,
+                 attn_dropout=0.0, lora_r=16, lora_alpha=32, lora_dropout=0.05):
         super().__init__()
         self.norm1 = RMSNorm(d_model)
-        self.attn = GQAttention(d_model, n_heads, n_kv_heads, rope_theta, attn_dropout=attn_dropout)
+        self.attn = GQAttention(
+            d_model, n_heads, n_kv_heads, rope_theta,
+            attn_dropout=attn_dropout,
+            lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+        )
         self.norm2 = RMSNorm(d_model)
-        self.ffn = LlamaMLP(d_model, ffn_dim, use_bias=False)
+        self.ffn = LlamaMLP(
+            d_model, ffn_dim, use_bias=False,
+            lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+        )
 
     def forward(self, x, position_ids, attention_mask=None):
         x = x + self.attn(self.norm1(x), position_ids, attention_mask)
         x = x + self.ffn(self.norm2(x))
         return x
+
 
 # ---------------- Llama‑3.2‑like 1B ----------------
 
@@ -158,6 +221,9 @@ class Llama3_1B(nn.Module):
         rope_theta,
         max_seq_len=256,
         attn_dropout=0.0,
+        lora_r=16,
+        lora_alpha=32,
+        lora_dropout=0.05,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -167,7 +233,11 @@ class Llama3_1B(nn.Module):
 
         self.token_emb = nn.Embedding(vocab_size, d_model)
         self.layers = nn.ModuleList([
-            LlamaBlock(d_model, ffn_dim, n_heads, n_kv_heads, rope_theta, attn_dropout=attn_dropout)
+            LlamaBlock(
+                d_model, ffn_dim, n_heads, n_kv_heads, rope_theta,
+                attn_dropout=attn_dropout,
+                lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+            )
             for _ in range(n_layers)
         ])
         self.norm = RMSNorm(d_model)
@@ -186,6 +256,7 @@ class Llama3_1B(nn.Module):
 
         x = self.norm(x)
         return self.lm_head(x)
+
 
 # ---------------- Validation helper ----------------
 
@@ -217,14 +288,14 @@ def evaluate(model, dev_loader, ce_loss, device):
     ppl = math.exp(mean_loss)
     return mean_loss, ppl
 
-# ---------------- TRAINING ----------------
+
+# ---------------- TRAINING & EMBEDDING INIT ----------------
 
 def main():
     wandb.init(project=PROJECT_NAME)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # 1) Llama‑3.2‑1B hyperparams
     hf_cfg = LlamaConfig.from_pretrained(MODEL_ID)
     d_model    = hf_cfg.hidden_size
     n_layers   = hf_cfg.num_hidden_layers
@@ -233,14 +304,12 @@ def main():
     ffn_dim    = hf_cfg.intermediate_size
     rope_theta = hf_cfg.rope_theta
 
-    # 2) Llama tokenizer + Alpaca dataset
+    # Llama tokenizer + Alpaca dataset
+    from transformers import AutoTokenizer
+
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, use_fast=False)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    print("tok_vocab_size:", tokenizer.vocab_size)
-
-    vocab_size = max(tokenizer.get_vocab().values()) + 1
-    print("effective_vocab_size:", vocab_size)
 
     full_dataset = build_alpaca_dataset(
         tokenizer,
@@ -248,21 +317,6 @@ def main():
         mask_prompt=True,
     )
 
-    print("dataset len:", len(full_dataset))
-    max_input = 0
-    max_label = 0
-    for ex in full_dataset:
-        inp = ex["input_ids"]
-        lab = ex["labels"]
-        if inp.numel() > 0:
-            max_input = max(max_input, int(inp.max()))
-        valid = lab[lab != -100]
-        if valid.numel() > 0:
-            max_label = max(max_label, int(valid.max()))
-    print("global max input_id:", max_input)
-    print("global max label:", max_label)
-
-    # 3) Train/dev split
     n_total = len(full_dataset)
     n_dev = int(VAL_FRAC * n_total)
     n_train = n_total - n_dev
@@ -280,7 +334,19 @@ def main():
     print("unique labels:", torch.unique(batch0["labels"]))
     print("ignore_index in CE:", -100)
 
-    # 4) Baseline Llama3_1B model
+    hf_lm = LlamaForCausalLM.from_pretrained(
+        MODEL_ID,
+        torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32,
+        device_map="cpu",
+    )
+
+    with torch.no_grad():
+        pretrained_emb = hf_lm.model.embed_tokens.weight  # (vocab_size, d_model)
+
+    vocab_size = pretrained_emb.shape[0]
+    del hf_lm
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
     model = Llama3_1B(
         vocab_size=vocab_size,
         d_model=d_model,
@@ -291,28 +357,31 @@ def main():
         rope_theta=rope_theta,
         max_seq_len=MAX_LEN,
         attn_dropout=0.0,
+        lora_r=16,
+        lora_alpha=32,
+        lora_dropout=0.05,
     ).to(device).to(torch.bfloat16)
-    print("model embedding size:", model.token_emb.num_embeddings)
 
-    # 4b) Initialize embeddings from pretrained Llama
-    hf_model = LlamaForCausalLM.from_pretrained(
-        MODEL_ID,
-        torch_dtype=torch.bfloat16,
-        device_map="cpu",
-    )
     with torch.no_grad():
-        pretrained_emb = hf_model.model.embed_tokens.weight  # (vocab_size, d_model)
         assert pretrained_emb.shape == model.token_emb.weight.shape
         model.token_emb.weight.copy_(pretrained_emb)
         model.lm_head.weight.data.copy_(model.token_emb.weight.data)
-    del hf_model
 
-    # 5) Optimizer, LR schedule, training loop
+    for name, p in model.named_parameters():
+        if "lora_A" in name or "lora_B" in name:
+            p.requires_grad = True
+        else:
+            p.requires_grad = False
+
     base_lr = BASE_LR
     total_steps = TOTAL_STEPS
     warmup_steps = WARMUP_STEPS
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=0.01)
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=base_lr,
+        weight_decay=0.01,
+    )
     ce_loss = nn.CrossEntropyLoss(ignore_index=-100)
 
     def get_lr(step):
@@ -332,13 +401,6 @@ def main():
             input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
             attention_mask = batch["attention_mask"].to(device)
-
-            max_in = int(input_ids.max())
-            valid_lab = labels[labels != -100]
-            max_lab = int(valid_lab.max()) if valid_lab.numel() > 0 else -1
-            assert max_in < vocab_size, f"input_id out of range: {max_in} >= {vocab_size}"
-            if max_lab >= 0:
-                assert max_lab < vocab_size, f"label out of range: {max_lab} >= {vocab_size}"
 
             lr = get_lr(step)
             for g in optimizer.param_groups:
@@ -398,7 +460,8 @@ def main():
         if step >= total_steps:
             break
 
-    print("DONE. Check W&B for baseline Llama3_1B (Llama tokenizer, Llama init).")
+    print("DONE. Check W&B for train and val curves for baseline Llama3_1B + LoRA.")
+
 
 if __name__ == "__main__":
     main()

@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import wandb
 from torch.utils.data import random_split, DataLoader
 
-from transformers import AutoModel, LlamaConfig
+from transformers import AutoModel, LlamaConfig, AutoTokenizer
 from alpaca_dataset import build_alpaca_dataset, get_alpaca_tokenizer
 
 
@@ -70,8 +70,13 @@ class LowRankEmbedding(nn.Module):
         self.Vk = nn.Parameter(Vk_init)  # (d_model, k)
 
     def forward(self, input_ids):
-        x = self.embed(input_ids)   # (B,S,d_model)
-        return x @ self.Vk          # (B,S,k)
+        x = self.embed(input_ids)                 # (B,S,d_model)
+        Vk = self.Vk.to(x.dtype)                  # ensure same dtype
+        
+        assert x.device == Vk.device, f"x on {x.device}, Vk on {Vk.device}"
+        assert x.dtype == Vk.dtype, f"x dtype {x.dtype}, Vk dtype {Vk.dtype}"
+
+        return x @ Vk                             # (B,S,k)
 
 
 # ---------------- GQA Attention (SDPA, low-rank) ----------------
@@ -262,10 +267,13 @@ def main():
     ffn_dim    = hf_cfg.intermediate_size
     rope_theta = hf_cfg.rope_theta
 
-    # 2) Build full Alpaca dataset
-    alpaca_tok = get_alpaca_tokenizer("distilbert-base-uncased")
+    # 2) Llama tokenizer + Alpaca dataset
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, use_fast=False)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
     full_dataset = build_alpaca_dataset(
-        alpaca_tok,
+        tokenizer,
         max_len=MAX_LEN,
         mask_prompt=True,
     )
@@ -288,25 +296,31 @@ def main():
     print("unique labels:", torch.unique(batch0["labels"]))
     print("ignore_index in CE:", -100)
 
-    vocab_size = alpaca_tok.vocab_size
+    # 4) Load Llama pretrained embeddings and do PCA to get Vk_init
+    hf_model = AutoModel.from_pretrained(
+        MODEL_ID,
+        torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32,
+        device_map="cpu",  # keep on CPU to save GPU memory
+    )
 
-    # 4) PCA init for Vk using a temporary embedding at d_model
-    k = 512  # low-rank dim (you can change this)
-    embed_tmp = nn.Embedding(vocab_size, d_model).to(device)
-    PCA_BATCH_LIMIT = 100
-    acts = []
     with torch.no_grad():
-        for i, batch in enumerate(train_loader):
-            if i >= PCA_BATCH_LIMIT:
-                break
-            ids = batch["input_ids"].to(device)
-            a = embed_tmp(ids).reshape(-1, d_model).cpu()
-            acts.append(a)
-    acts = torch.cat(acts, dim=0)
-    print("PCA source acts shape:", acts.shape)
+        # Llama embeddings: (vocab_size, d_model)
+        pretrained_emb = hf_model.embed_tokens.weight.float().cpu()
 
-    U, S, V = torch.pca_lowrank(acts, q=k, center=True)
+    print("pretrained_emb shape:", pretrained_emb.shape)  # (V, d_model)
+    print("tokenizer.vocab_size:", tokenizer.vocab_size)
+    vocab_size = pretrained_emb.shape[0]
+
+    k = 1280  # low-rank dimension
+    # Centered PCA on the pretrained embedding matrix
+    U, S, V = torch.pca_lowrank(pretrained_emb, q=k, center=True)
     Vk_init = V[:, :k].contiguous()  # (d_model, k)
+
+    del hf_model  # free memory
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+    Vk_init = Vk_init.to(device)           # device: "cuda" or "cpu"
+    Vk_init = Vk_init.to(torch.bfloat16)   # match model dtype if you use bf16
 
     # 5) Low‑rank Llama3_1B‑like with SDPA attention, bf16
     model = Llama3_1B_LowRank(
@@ -348,6 +362,14 @@ def main():
             input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
             attention_mask = batch["attention_mask"].to(device)
+
+            # ---- sanity check: input_ids within vocab ----
+            max_in = int(input_ids.max())
+            min_in = int(input_ids.min())
+            # print(f"min_in: {min_in}, max_in: {max_in}, vocab_size: {vocab_size}")
+            assert 0 <= min_in
+            assert max_in < vocab_size, f"input_id {max_in} >= vocab_size {vocab_size}"
+            # ----------------------------------------------
 
             lr = get_lr(step)
             for g in optimizer.param_groups:
