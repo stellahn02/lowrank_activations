@@ -7,6 +7,8 @@ from torch.cuda.amp import autocast
 from datasets import load_dataset
 from transformers import AutoTokenizer, LlamaForSequenceClassification, get_cosine_schedule_with_warmup, BitsAndBytesConfig
 from peft import IA3Config, get_peft_model, TaskType, prepare_model_for_kbit_training
+from bitsandbytes.optim import AdamW8bit
+
 
 # ---------------- CONFIG ----------------
 MODEL_ID = "meta-llama/Llama-3.2-1B"
@@ -134,9 +136,19 @@ def main():
 
     # wrap model with IA³
     base_model = prepare_model_for_kbit_training(base_model)
+    for n,p in base_model.named_parameters():
+        if p.is_floating_point() and p.dtype == torch.float32:
+            print("fp32:", n, p.shape)
+            break
     model = get_peft_model(base_model, ia3_config)
 
+    # Verification Loop
+    for name, param in model.named_parameters():
+        if "lars_params" in name:
+            print(f"Adapter Param: {name} | Dtype: {param.dtype} | Device: {param.device}")
+
     model.config.pad_token_id = tokenizer.pad_token_id
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.train()
 
     model.print_trainable_parameters()
@@ -144,7 +156,7 @@ def main():
     print(f"Trainable params: {sum(p.numel() for p in trainable):,} / {sum(p.numel() for p in model.parameters()):,}")
 
     # Optimizer + scheduler
-    optimizer = torch.optim.AdamW(trainable, lr=LR, weight_decay=0.01)
+    optimizer = AdamW8bit(trainable, lr=LR, weight_decay=0.01)
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=WARMUP_STEPS,

@@ -6,6 +6,7 @@ from torch.utils.data import DataLoader
 from datasets import load_dataset
 from transformers import AutoTokenizer, LlamaForSequenceClassification, get_cosine_schedule_with_warmup, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
+from bitsandbytes.optim import AdamW8bit
 
 # ---------------- CONFIG ----------------
 MODEL_ID = "meta-llama/Llama-3.2-1B"
@@ -135,8 +136,10 @@ def main():
         target_modules="all-linear",
         task_type=TaskType.SEQ_CLS,
     )
+    
     model = get_peft_model(base_model, lora_config)
     model.config.pad_token_id = tokenizer.pad_token_id
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.train()
 
     model.print_trainable_parameters()
@@ -144,7 +147,7 @@ def main():
     print(f"Trainable params: {sum(p.numel() for p in trainable):,} / {sum(p.numel() for p in model.parameters()):,}")
 
     # Optimizer + scheduler
-    optimizer = torch.optim.AdamW(trainable, lr=LR, weight_decay=0.01)
+    optimizer = AdamW8bit(trainable, lr=LR, weight_decay=0.01)
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=WARMUP_STEPS,
