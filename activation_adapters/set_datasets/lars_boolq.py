@@ -13,12 +13,13 @@ PROJECT_NAME = "llama_boolq_peft"
 
 BATCH_SIZE = 8
 STEPS = 3000
-LR = 5e-4
-WARMUP_STEPS = 300
+LR = 1e-4
+WARMUP_STEPS = 100
 MAX_LEN = 256
 ACCUM_STEPS = 4  # gradient accumulation
 
-LARS_RANK = 16
+LARS_RANK = 8
+torch.cuda.empty_cache()
 
 # ---------------- DATASET ----------------
 def build_boolq_dataset(tokenizer, max_len):
@@ -30,7 +31,7 @@ def build_boolq_dataset(tokenizer, max_len):
             text,
             truncation=True,
             max_length=max_len,
-            padding=False,
+            padding='max_length',
         )
         return {
             "input_ids": enc["input_ids"],
@@ -109,6 +110,9 @@ def main():
 
     # wrap model with LARS
     model = get_peft_model(base_model, lars_config)
+    # model.gradient_checkpointing_enable()
+    # model.config.use_cache = False
+    # model.enable_input_require_grads()
     model.config.pad_token_id = tokenizer.pad_token_id
     model.to(device)
     model.train()
@@ -125,14 +129,15 @@ def main():
         num_training_steps=STEPS,
     )
 
-    for n, p in model.named_parameters():
-        if "U.weight" in n or "V.weight" in n or p.requires_grad==True:
-            print(n, p.requires_grad)
+    # for n, p in model.named_parameters():
+    #     if "U.weight" in n or "V.weight" in n or p.requires_grad==True:
+            # print(n, p.requires_grad)
 
     # Training loop
     step = 0
     optimizer.zero_grad()
     for epoch in range(1000):
+        torch.cuda.empty_cache()
         for batch_idx, batch in enumerate(train_loader):
             if step >= STEPS:
                 break
