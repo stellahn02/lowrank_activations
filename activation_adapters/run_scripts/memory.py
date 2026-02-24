@@ -22,7 +22,7 @@ from peft import (
 )
 import wandb
 from tqdm import tqdm
-
+from utils import build_boolq_dataset, boolq_collate_fn, boolq_evaluate
 # -------------------------
 # Argument Parser
 # -------------------------
@@ -37,11 +37,7 @@ def parse_args():
                         choices=["lora", "adalora", "ia3", "prefix", "prompt", "bitfit", "lars", "full"])
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--accum_steps", type=int, default=4)
-    # parser.add_argument("--lr", type=float, default=2e-5) #FT
-    # parser.add_argument("--lr", type=float, default=1e-4) #LARS, LoRA
-    # parser.add_argument("--lr", type=float, default=5e-3) #IA3
-    parser.add_argument("--lr", type=float, default=1e-3) #prefix
-    # parser.add_argument("--lr", type=float, default=5e-2) #prompt
+    parser.add_argument("--lr", type=float, default=1e-4) #LARS, LoRA
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--max_len", type=int, default=256)
     parser.add_argument("--checkpointing", action="store_true")
@@ -51,67 +47,6 @@ def parse_args():
                         choices=["boolq", "piqa"])
 
     return parser.parse_args()
-
-
-# -------------------------
-# Dataset
-# -------------------------
-def build_boolq_dataset(tokenizer, max_len):
-    ds = load_dataset("boolq")
-
-    def preprocess(ex):
-        text = f"Question: {ex['question']}\nPassage: {ex['passage']}"
-        enc = tokenizer(
-            text,
-            truncation=True,
-            max_length=max_len,
-            padding=False,
-        )
-        return {
-            "input_ids": enc["input_ids"],
-            "attention_mask": enc["attention_mask"],
-            "labels": int(ex["answer"]),  # 0/1 for sequence classification
-        }
-
-    ds = ds.map(preprocess, remove_columns=ds["train"].column_names)
-    return ds
-
-def build_piqa_dataset(tokenizer, max_len):
-    ds = load_dataset("lighteval/piqa")
-
-    def preprocess(ex):
-        text = (
-            f"Goal: {ex['goal']}\n"
-            f"Solution 1: {ex['sol1']}\n"
-            f"Solution 2: {ex['sol2']}"
-        )
-
-        enc = tokenizer(
-            text,
-            truncation=True,
-            max_length=max_len,
-            padding=False,
-        )
-
-        return {
-            "input_ids": enc["input_ids"],
-            "attention_mask": enc["attention_mask"],
-            "labels": ex["label"],  # already 0 or 1
-        }
-
-    ds = ds.map(preprocess, remove_columns=ds["train"].column_names)
-    return ds
-
-def collate_fn(batch, pad_id):
-    max_len = max(len(x["input_ids"]) for x in batch)
-    input_ids = [x["input_ids"] + [pad_id]*(max_len - len(x["input_ids"])) for x in batch]
-    attention_mask = [x["attention_mask"] + [0]*(max_len - len(x["attention_mask"])) for x in batch]
-    labels = [x["labels"] for x in batch]
-    return {
-        "input_ids": torch.tensor(input_ids, dtype=torch.long),
-        "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
-        "labels": torch.tensor(labels, dtype=torch.long),
-    }
 
 
 
@@ -136,13 +71,14 @@ def get_peft_config(method):
             init_r=8,
             lora_alpha=16,
             task_type=TaskType.SEQ_CLS,
-            total_step=1500
+            total_step=1500,
+            target_modules="all-linear",
         )
 
     elif method == "ia3":
         return IA3Config(
             task_type=TaskType.SEQ_CLS,
-            target_modules=["k_proj", "v_proj", "down_proj"],
+            target_modules="all-linear",
         )
 
     elif method == "prefix":
@@ -172,10 +108,27 @@ def get_peft_config(method):
 
 def get_dataset(dataset_name, tokenizer, max_len):
     if dataset_name == "boolq":
-        return build_boolq_dataset(tokenizer, max_len)
-    elif dataset_name == "piqa":
-        return build_piqa_dataset(tokenizer, max_len)
-    
+        dataset = build_boolq_dataset(tokenizer, max_len)
+        evaluate_fn = boolq_evaluate
+        collate_fn = boolq_collate_fn
+        return dataset, evaluate_fn, collate_fn
+
+
+def get_lr(method):
+    if method == "lora" or method == "lars":
+        return 1e-4
+    if method == "prompt":
+        return 1e-5
+    if method == "prefix":
+        return 1e-5
+    elif method == "adalora":
+        return 5e-4
+    elif method == "ia3":
+        return 5e-3
+    elif method == "full":
+        return 2e-5
+    else:
+        raise ValueError(f"Unknown PEFT method: {method}")    
 
 
 # -------------------------
@@ -188,29 +141,6 @@ def apply_bitfit(model):
         else:
             param.requires_grad = False
     return model
-
-
-# -------------------------
-# Evaluation
-# -------------------------
-@torch.no_grad()
-def evaluate(model, dev_loader, device):
-    model.eval()
-    correct = total = 0
-
-    for batch in dev_loader:
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        labels = batch["labels"].to(device)
-
-        logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
-        preds = logits.argmax(dim=-1)
-
-        correct += (preds == labels).sum().item()
-        total += labels.size(0)
-
-    model.train()
-    return correct / total
 
 
 # -------------------------
@@ -227,7 +157,7 @@ def main():
 
 
     # dataset = build_boolq_dataset(tokenizer, args.max_len)
-    dataset = get_dataset(args.dataset, tokenizer, args.max_len)
+    dataset, evaluate_fn, collate_fn = get_dataset(args.dataset, tokenizer, args.max_len)
 
     train_loader = DataLoader(dataset["train"], batch_size=args.batch_size,
                               shuffle=True, collate_fn=lambda b: collate_fn(b, tokenizer.pad_token_id),)
@@ -253,7 +183,7 @@ def main():
     else:
         peft_config = get_peft_config(args.peft_method)
         model = get_peft_model(model, peft_config)
-
+    args.lr = get_lr(args.peft_method)
     model.to(device)
 
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -281,9 +211,11 @@ def main():
     # Training loop
     step = 0
     optimizer.zero_grad()
+    torch.cuda.reset_peak_memory_stats()  # reset memory stats at the start of training
+    torch.cuda.empty_cache()  # clear any cached memory
     for epoch in range(1000):
         for batch_idx, batch in enumerate(train_loader):
-            if step >= 3000:
+            if step >= 1500:
                 break
 
             input_ids = batch["input_ids"].to(device)
@@ -308,7 +240,7 @@ def main():
                 # evaluate only every 50 steps
                 acc = None
                 if step % 50 == 0 and step > 0:
-                    acc = evaluate(model, val_loader, device)
+                    acc = evaluate_fn(model, val_loader, device)
 
                 log_dict = {
                     "loss": float(loss.item() * args.accum_steps),
@@ -327,7 +259,7 @@ def main():
 
                 step += 1
 
-        if step >= 3000:
+        if step >= 1500:
             break
 
     print("Training complete.")
