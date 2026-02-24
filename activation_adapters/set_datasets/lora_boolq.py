@@ -11,11 +11,11 @@ from peft import LoraConfig, get_peft_model, TaskType
 MODEL_ID = "meta-llama/Llama-3.2-1B"
 PROJECT_NAME = "llama_boolq_peft"
 
-BATCH_SIZE = 2
+BATCH_SIZE = 8
 STEPS = 3000
-LR = 5e-4
+LR = 1e-4
 WARMUP_STEPS = 100
-MAX_LEN = 2560*8
+MAX_LEN = 256
 ACCUM_STEPS = 4  # gradient accumulation
 
 LORA_RANK = 8
@@ -109,9 +109,9 @@ def main():
         task_type=TaskType.SEQ_CLS,
     )
     model = get_peft_model(base_model, lora_config)
-    model.gradient_checkpointing_enable()
-    model.config.use_cache = False
-    model.enable_input_require_grads()
+    # model.gradient_checkpointing_enable()
+    # model.config.use_cache = False
+    # model.enable_input_require_grads()
     model.config.pad_token_id = tokenizer.pad_token_id
     model.to(device)
     model.train()

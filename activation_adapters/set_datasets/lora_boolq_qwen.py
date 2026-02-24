@@ -1,15 +1,16 @@
+import os
 import math
 import torch
 import torch.nn as nn
 import wandb
 from torch.utils.data import DataLoader
 from datasets import load_dataset
-from transformers import AutoTokenizer, LlamaForSequenceClassification, get_cosine_schedule_with_warmup
-from peft import LARSConfig, get_peft_model, TaskType
+from transformers import AutoTokenizer,  AutoModelForSequenceClassification, get_cosine_schedule_with_warmup
+from peft import LoraConfig, get_peft_model, TaskType
 
 # ---------------- CONFIG ----------------
-MODEL_ID = "meta-llama/Llama-3.2-1B"
-PROJECT_NAME = "llama_boolq_peft"
+MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
+PROJECT_NAME = "qwen2.5_boolq_peft"
 
 BATCH_SIZE = 8
 STEPS = 3000
@@ -18,8 +19,11 @@ WARMUP_STEPS = 100
 MAX_LEN = 256
 ACCUM_STEPS = 4  # gradient accumulation
 
-LARS_RANK = 8
+LORA_RANK = 8
+LORA_ALPHA = 8
+LORA_DROPOUT = 0.05
 torch.cuda.empty_cache()
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 # ---------------- DATASET ----------------
 def build_boolq_dataset(tokenizer, max_len):
@@ -99,17 +103,23 @@ def main():
     )
 
     # Model + LoRA
-    base_model = LlamaForSequenceClassification.from_pretrained(MODEL_ID, num_labels=2)
-    # LARS adapter config
-    lars_config = LARSConfig(
-        task_type=TaskType.SEQ_CLS,   # sequence classification
-        target_modules= "all-linear",
-        fan_in_fan_out=False,              # use fan-in scaling, optional
-        rank=LARS_RANK,
+    base_model = AutoModelForSequenceClassification.from_pretrained(
+        MODEL_ID, 
+        num_labels=2,
+        device_map={"": 0},             
+        torch_dtype=torch.bfloat16,   
+        trust_remote_code=True        
     )
-
-    # wrap model with LARS
-    model = get_peft_model(base_model, lars_config)
+    lora_config = LoraConfig(
+        r=LORA_RANK,
+        lora_alpha=LORA_ALPHA,
+        lora_dropout=LORA_DROPOUT,
+        target_modules="all-linear",
+        task_type=TaskType.SEQ_CLS,
+    )
+    model = get_peft_model(base_model, lora_config)
+    model.to(torch.bfloat16)
+    model.score.to(torch.bfloat16)
     # model.gradient_checkpointing_enable()
     # model.config.use_cache = False
     # model.enable_input_require_grads()
@@ -129,15 +139,10 @@ def main():
         num_training_steps=STEPS,
     )
 
-    # for n, p in model.named_parameters():
-    #     if "U.weight" in n or "V.weight" in n or p.requires_grad==True:
-            # print(n, p.requires_grad)
-
     # Training loop
     step = 0
     optimizer.zero_grad()
     for epoch in range(1000):
-        torch.cuda.empty_cache()
         for batch_idx, batch in enumerate(train_loader):
             if step >= STEPS:
                 break
@@ -190,3 +195,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+

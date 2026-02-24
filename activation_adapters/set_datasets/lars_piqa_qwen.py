@@ -1,3 +1,4 @@
+import os
 import math
 import torch
 import torch.nn as nn
@@ -5,21 +6,22 @@ import wandb
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from datasets import load_dataset
-from transformers import AutoTokenizer, LlamaForSequenceClassification, get_cosine_schedule_with_warmup
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, get_cosine_schedule_with_warmup
 from peft import LARSConfig, get_peft_model, TaskType
 
 # ---------------- CONFIG ----------------
-MODEL_ID = "meta-llama/Llama-3.2-1B"
-PROJECT_NAME = "llama_piqa_peft"
+MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
+PROJECT_NAME = "qwen2.5_piqa_peft"
 
-BATCH_SIZE = 8
+BATCH_SIZE = 4
 STEPS = 3000
-LR = 5e-4
+LR = 1e-4
 WARMUP_STEPS = 300
 MAX_LEN = 256
-ACCUM_STEPS = 4  # gradient accumulation
+ACCUM_STEPS = 16  # gradient accumulation
 
 LARS_RANK = 8
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 # ---------------- DATASET ----------------
 def build_piqa_pair_dataset(tokenizer, max_len):
@@ -129,8 +131,14 @@ def main():
         collate_fn=lambda b: collate_piqa_pairs(b, tokenizer.pad_token_id),
     )
 
-    # Model + LoRA
-    base_model = LlamaForSequenceClassification.from_pretrained(MODEL_ID, num_labels=2)
+    # Model + LoARS
+    base_model = AutoModelForSequenceClassification.from_pretrained(
+        MODEL_ID, 
+        num_labels=2,
+        device_map={"": 0},             
+        torch_dtype=torch.bfloat16,   
+        trust_remote_code=True        
+    )
     
     # LARS adapter config
     lars_config = LARSConfig(
@@ -143,6 +151,8 @@ def main():
     # wrap model with LARS
     model = get_peft_model(base_model, lars_config)
     print(f"Total Params: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
+    model.to(torch.bfloat16)
+    model.score.to(torch.bfloat16)
     model.config.pad_token_id = tokenizer.pad_token_id
     model.to(device)
     model.train()
