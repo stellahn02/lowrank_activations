@@ -118,9 +118,9 @@ def get_lr(method):
     if method == "lora" or method == "lars":
         return 1e-4
     if method == "prompt":
-        return 1e-5
+        return 5e-4
     if method == "prefix":
-        return 1e-5
+        return 5e-4
     elif method == "adalora":
         return 5e-4
     elif method == "ia3":
@@ -211,10 +211,10 @@ def main():
     # Training loop
     step = 0
     optimizer.zero_grad()
-    torch.cuda.reset_peak_memory_stats()  # reset memory stats at the start of training
-    torch.cuda.empty_cache()  # clear any cached memory
+    
     for epoch in range(1000):
         for batch_idx, batch in enumerate(train_loader):
+            torch.cuda.empty_cache()  # clear any cached memory
             if step >= 1500:
                 break
 
