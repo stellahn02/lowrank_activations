@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from datasets import load_dataset
 from transformers import AutoTokenizer, LlamaForSequenceClassification, get_cosine_schedule_with_warmup
-from peft import LARSConfig, get_peft_model, TaskType
+from peft import LoraConfig, get_peft_model, TaskType
 
 # ---------------- CONFIG ----------------
 MODEL_ID = "meta-llama/Llama-3.2-1B"
@@ -19,7 +19,10 @@ WARMUP_STEPS = 300
 MAX_LEN = 256
 ACCUM_STEPS = 4  # gradient accumulation
 
-LARS_RANK = 8
+LORA_RANK = 8
+LORA_ALPHA = 8
+LORA_DROPOUT = 0.05
+torch.cuda.empty_cache()
 
 # ---------------- DATASET ----------------
 def build_piqa_pair_dataset(tokenizer, max_len):
@@ -131,17 +134,15 @@ def main():
 
     # Model + LoRA
     base_model = LlamaForSequenceClassification.from_pretrained(MODEL_ID, num_labels=2)
-    
-    # LARS adapter config
-    lars_config = LARSConfig(
-        task_type=TaskType.SEQ_CLS,   # sequence classification
-        target_modules= "all-linear",
-        fan_in_fan_out=False,              # use fan-in scaling, optional
-        rank=LARS_RANK,
+    lora_config = LoraConfig(
+        r=LORA_RANK,
+        lora_alpha=LORA_ALPHA,
+        lora_dropout=LORA_DROPOUT,
+        target_modules="all-linear",
+        task_type=TaskType.SEQ_CLS,
     )
 
-    # wrap model with LARS
-    model = get_peft_model(base_model, lars_config)
+    model = get_peft_model(base_model, lora_config)
     print(f"Total Params: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
     model.config.pad_token_id = tokenizer.pad_token_id
     model.to(device)

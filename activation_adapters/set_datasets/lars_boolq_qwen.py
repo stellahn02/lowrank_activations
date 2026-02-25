@@ -1,15 +1,16 @@
+import os
 import math
 import torch
 import torch.nn as nn
 import wandb
 from torch.utils.data import DataLoader
 from datasets import load_dataset
-from transformers import AutoTokenizer, LlamaForSequenceClassification, get_cosine_schedule_with_warmup
-from peft import LARSConfig, get_peft_model, TaskType
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, get_cosine_schedule_with_warmup, BitsAndBytesConfig
+from peft import LARSConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
 
 # ---------------- CONFIG ----------------
-MODEL_ID = "meta-llama/Llama-3.2-1B"
-PROJECT_NAME = "llama_boolq_peft"
+MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
+PROJECT_NAME = "qwen2.5_boolq_peft"
 
 BATCH_SIZE = 8
 STEPS = 3000
@@ -19,7 +20,7 @@ MAX_LEN = 256
 ACCUM_STEPS = 4  # gradient accumulation
 
 LARS_RANK = 8
-torch.cuda.empty_cache()
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 # ---------------- DATASET ----------------
 def build_boolq_dataset(tokenizer, max_len):
@@ -31,7 +32,7 @@ def build_boolq_dataset(tokenizer, max_len):
             text,
             truncation=True,
             max_length=max_len,
-            padding='max_length',
+            padding=False,
         )
         return {
             "input_ids": enc["input_ids"],
@@ -98,8 +99,26 @@ def main():
         collate_fn=lambda b: collate_fn(b, tokenizer.pad_token_id),
     )
 
-    # Model + LoRA
-    base_model = LlamaForSequenceClassification.from_pretrained(MODEL_ID, num_labels=2)
+    # 12GB Optimization: 4-bit Quantization Config
+    # bnb_config = BitsAndBytesConfig(
+    #     load_in_4bit=True,
+    #     bnb_4bit_use_double_quant=True,
+    #     bnb_4bit_quant_type="nf4",
+    #     bnb_4bit_compute_dtype=torch.bfloat16 # bf16 is more stable for Qwen
+    # )
+
+    # Model + LARS
+    base_model = AutoModelForSequenceClassification.from_pretrained(
+        MODEL_ID, 
+        num_labels=2,
+        # quantization_config=bnb_config,
+        device_map={"": 0},             
+        torch_dtype=torch.bfloat16,   
+        trust_remote_code=True        
+    )
+
+    # base_model = prepare_model_for_kbit_training(base_model)
+
     # LARS adapter config
     lars_config = LARSConfig(
         task_type=TaskType.SEQ_CLS,   # sequence classification
@@ -110,9 +129,10 @@ def main():
 
     # wrap model with LARS
     model = get_peft_model(base_model, lars_config)
-    # model.gradient_checkpointing_enable()
-    # model.config.use_cache = False
-    # model.enable_input_require_grads()
+    model.to(torch.bfloat16)
+    model.score.to(torch.bfloat16)
+    # model.gradient_checkpointing_enable() 
+    # model.config.use_cache = False     
     model.config.pad_token_id = tokenizer.pad_token_id
     model.to(device)
     model.train()
@@ -129,15 +149,14 @@ def main():
         num_training_steps=STEPS,
     )
 
-    # for n, p in model.named_parameters():
-    #     if "U.weight" in n or "V.weight" in n or p.requires_grad==True:
-            # print(n, p.requires_grad)
+    for n, p in model.named_parameters():
+        if "U.weight" in n or "V.weight" in n or p.requires_grad==True:
+            print(n, p.requires_grad)
 
     # Training loop
     step = 0
     optimizer.zero_grad()
     for epoch in range(1000):
-        torch.cuda.empty_cache()
         for batch_idx, batch in enumerate(train_loader):
             if step >= STEPS:
                 break
