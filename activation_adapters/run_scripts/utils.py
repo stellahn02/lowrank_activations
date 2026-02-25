@@ -12,7 +12,8 @@ def build_boolq_dataset(tokenizer, max_len):
             text,
             truncation=True,
             max_length=max_len,
-            padding=False,
+            padding=False, # Dynamic Padding
+            # padding="max_length", # Static Padding
         )
         return {
             "input_ids": enc["input_ids"],
