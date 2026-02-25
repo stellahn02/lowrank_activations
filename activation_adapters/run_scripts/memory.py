@@ -278,7 +278,6 @@ def main():
                 # evaluate only every 50 steps
                 acc = None
                 if step % 50 == 0 and step > 0:
-                    del loss
                     acc = evaluate_fn(model, val_loader, device)
 
                 log_dict = {
