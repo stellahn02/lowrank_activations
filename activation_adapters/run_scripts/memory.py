@@ -10,6 +10,8 @@ from transformers import (
     LlamaForSequenceClassification,
     AutoModelForSequenceClassification,
     get_cosine_schedule_with_warmup,
+    LlamaForCausalLM,
+    AutoModelForCausalLM
 )
 from peft import (
     LoraConfig,
@@ -26,7 +28,8 @@ from tqdm import tqdm
 from utils import ( 
     build_boolq_dataset, boolq_collate_fn, boolq_evaluate, boolq_forward_step,
     build_piqa_dataset, piqa_collate_fn, piqa_forward_step, piqa_evaluate,
-    build_hellaswag_dataset, hellaswag_collate_fn, hellaswag_forward_step, hellaswag_evaluate
+    build_hellaswag_dataset, hellaswag_collate_fn, hellaswag_forward_step, hellaswag_evaluate,
+    build_subject_dataset, collate_fn_subject, pack_10way_batch, mmlu_forward_step, evaluate_mmlu,
 ) 
 # -------------------------
 # Argument Parser
@@ -42,7 +45,7 @@ def parse_args():
                         choices=["lora", "adalora", "ia3", "prefix", "prompt", "bitfit", "lars", "full"])
     parser.add_argument("--model_name", type=str, default="llama", 
                         choices=["llama", "qwen"])
-    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--accum_steps", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4) #LARS, LoRA
     parser.add_argument("--epochs", type=int, default=3)
@@ -51,7 +54,7 @@ def parse_args():
     parser.add_argument("--project", type=str, default="boolq_llama_peft")
     parser.add_argument("--eval_every", type=int, default=200)
     parser.add_argument("--dataset",  type=str, default="boolq",
-                        choices=["boolq", "piqa", "hellaswag"])
+                        choices=["boolq", "piqa", "hellaswag", "business", "biology", "law", "economics", "history", "physics","health"])
 
     return parser.parse_args()
 
@@ -109,7 +112,7 @@ def get_peft_config(method):
         target_modules= "all-linear",
         fan_in_fan_out=False,              # use fan-in scaling, optional
         rank=8,
-        learned_pooling=False,    
+        learned_pooling=True,    
     )
 
 
@@ -132,7 +135,13 @@ def get_dataset(dataset_name, tokenizer, max_len):
         dataset = build_hellaswag_dataset(tokenizer, max_len)
         evaluate_fn = hellaswag_evaluate
         collate_fn = hellaswag_collate_fn
-        forward_step = hellaswag_forward_step     
+        forward_step = hellaswag_forward_step 
+
+    if dataset_name in ["biology", "business", "law", "economics", "history", "physics", "health"]:
+        dataset = build_subject_dataset(tokenizer, max_len, dataset_name)
+        evaluate_fn = evaluate_mmlu
+        collate_fn = collate_fn_subject
+        forward_step = mmlu_forward_step    
     
     return dataset, evaluate_fn, collate_fn, forward_step
 
@@ -170,7 +179,7 @@ def apply_bitfit(model):
 # -------------------------
 def main():
     args = parse_args()
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    # os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     wandb.init(project=args.project, config=vars(args))
@@ -181,19 +190,29 @@ def main():
     }
     model_id = MODEL_MAP[args.model_name]
 
-    if args.model_name == "llama":
-        model = LlamaForSequenceClassification.from_pretrained(
-            model_id,
-            num_labels=2,
-        )
-    else: #qwen
-        model = AutoModelForSequenceClassification.from_pretrained(
-            model_id,
-            num_labels=2,
-            device_map={"": 0},
-            torch_dtype=torch.bfloat16,
-            trust_remote_code=True
-        )
+    if args.dataset in ["biology", "business", "law", "economics", "history", "physics", "health"]:
+        if args.model_name == "llama":
+            model = LlamaForCausalLM.from_pretrained(
+                model_id,
+            )
+        else: #qwen
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+            )
+    else:
+        if args.model_name == "llama":
+            model = LlamaForSequenceClassification.from_pretrained(
+                model_id,
+                num_labels=2,
+            )
+        else: #qwen
+            model = AutoModelForSequenceClassification.from_pretrained(
+                model_id,
+                num_labels=2,
+                device_map={"": 0},
+                torch_dtype=torch.bfloat16,
+                trust_remote_code=True
+            )
 
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
