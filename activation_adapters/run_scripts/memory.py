@@ -1,6 +1,7 @@
 import os
 import argparse
 import torch
+import time
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
@@ -26,6 +27,7 @@ from peft import (
 import wandb
 from tqdm import tqdm
 from utils import ( 
+    measure_latency,
     build_boolq_dataset, boolq_collate_fn, boolq_evaluate, boolq_forward_step,
     build_piqa_dataset, piqa_collate_fn, piqa_forward_step, piqa_evaluate,
     build_hellaswag_dataset, hellaswag_collate_fn, hellaswag_forward_step, hellaswag_evaluate,
@@ -45,16 +47,18 @@ def parse_args():
                         choices=["lora", "adalora", "ia3", "prefix", "prompt", "bitfit", "lars", "full"])
     parser.add_argument("--model_name", type=str, default="llama", 
                         choices=["llama", "qwen"])
-    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--accum_steps", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4) #LARS, LoRA
     parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--total_steps", type=int, default=1500)
     parser.add_argument("--max_len", type=int, default=256)
+    parser.add_argument("--rank", type=int, default=8)
     parser.add_argument("--checkpointing", action="store_true")
     parser.add_argument("--project", type=str, default="boolq_llama_peft")
     parser.add_argument("--eval_every", type=int, default=200)
     parser.add_argument("--dataset",  type=str, default="boolq",
-                        choices=["boolq", "piqa", "hellaswag", "business", "biology", "law", "economics", "history", "physics","health"])
+                        choices=["boolq", "piqa", "hellaswag", "business", "biology", "law", "economics", "history", "physics","health", "math", "computer science"])
 
     return parser.parse_args()
 
@@ -63,11 +67,11 @@ def parse_args():
 # -------------------------
 # PEFT Config Factory
 # -------------------------
-def get_peft_config(method):
+def get_peft_config(method, rank, total_steps):
 
     if method == "lora":
         return LoraConfig(
-            r=8,
+            r=rank,
             lora_alpha=16,
             target_modules="all-linear",
             lora_dropout=0.05,
@@ -76,12 +80,12 @@ def get_peft_config(method):
 
     elif method == "adalora":
         return AdaLoraConfig(
-            r=8,
+            r=rank,
             target_r=4,
             init_r=8,
             lora_alpha=16,
             task_type=TaskType.SEQ_CLS,
-            total_step=1500,
+            total_step=total_steps,
             target_modules="all-linear",
         )
 
@@ -111,8 +115,8 @@ def get_peft_config(method):
         task_type=TaskType.SEQ_CLS,   # sequence classification
         target_modules= "all-linear",
         fan_in_fan_out=False,              # use fan-in scaling, optional
-        rank=8,
-        learned_pooling=True,    
+        rank=rank,
+        learned_pooling=False,    
     )
 
 
@@ -137,7 +141,7 @@ def get_dataset(dataset_name, tokenizer, max_len):
         collate_fn = hellaswag_collate_fn
         forward_step = hellaswag_forward_step 
 
-    if dataset_name in ["biology", "business", "law", "economics", "history", "physics", "health"]:
+    if dataset_name in ["biology", "business", "law", "economics", "history", "physics", "health", "math", "computer science"]:
         dataset = build_subject_dataset(tokenizer, max_len, dataset_name)
         evaluate_fn = evaluate_mmlu
         collate_fn = collate_fn_subject
@@ -190,7 +194,7 @@ def main():
     }
     model_id = MODEL_MAP[args.model_name]
 
-    if args.dataset in ["biology", "business", "law", "economics", "history", "physics", "health"]:
+    if args.dataset in ["biology", "business", "law", "economics", "history", "physics", "health", "math", "computer science"]:
         if args.model_name == "llama":
             model = LlamaForCausalLM.from_pretrained(
                 model_id,
@@ -237,7 +241,7 @@ def main():
     elif args.peft_method == "full":
         pass  # fine-tune all parameters, no adapter
     else:
-        peft_config = get_peft_config(args.peft_method)
+        peft_config = get_peft_config(args.peft_method, args.rank, args.total_steps)
         model = get_peft_model(model, peft_config)
 
     if args.model_name == "qwen":
@@ -261,24 +265,34 @@ def main():
         lr=args.lr, weight_decay=0.01
     )
 
-    total_steps = 3000
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=100,
-        num_training_steps=total_steps,
+        num_training_steps=args.total_steps,
     )
 
 
     model.train()
     # Training loop
     step = 0
+    total_tokens = 0
+    latency, inf_tps = None, None
     optimizer.zero_grad()
     torch.cuda.reset_peak_memory_stats()  # reset memory stats at the start of training
     torch.cuda.empty_cache()  # clear any cached memory
     for epoch in range(1000):
         for batch_idx, batch in enumerate(train_loader):
-            if step >= 1500:
+            start_time = time.time()
+            
+            if step >= args.total_steps:
                 break
+
+            if args.dataset in ["biology", "business", "law", "economics", "history", "physics", "health", "math", "computer science"]:
+                pad_id = model.config.pad_token_id
+                ids, _, _ = pack_10way_batch(batch, device, pad_id)
+                total_tokens += ids.numel()
+            else:
+                total_tokens += batch["input_ids"].numel()
 
             loss = forward_step(args.accum_steps, model, batch, device)
             loss.backward()
@@ -293,11 +307,18 @@ def main():
                 mem_alloc = torch.cuda.memory_allocated() / 1e6 if torch.cuda.is_available() else 0
                 mem_peak  = torch.cuda.max_memory_allocated() / 1e6 if torch.cuda.is_available() else 0
                 mem_reserved = torch.cuda.memory_reserved() / 1e6 if torch.cuda.is_available() else 0
+                
+                elapsed = time.time() - start_time
+                tokens_per_sec = total_tokens / elapsed if elapsed > 0 else 0
 
                 # evaluate only every 50 steps
                 acc = None
+
                 if step % 50 == 0 and step > 0:
                     acc = evaluate_fn(model, val_loader, device)
+                    if step % 100 == 0 and latency is None and args.dataset in ["boolq"]:
+                        latency, inf_tps = measure_latency(model, val_loader, device)
+
 
                 log_dict = {
                     "loss": float(loss.item() * args.accum_steps),
@@ -310,13 +331,18 @@ def main():
                 }
                 if acc is not None:
                     log_dict["acc"] = acc
+                    log_dict["tokens_per_sec"] = tokens_per_sec
+                if latency is not None:
+                    log_dict["inference_latency_sec"] = latency
+                    log_dict["inference_tokens_per_sec"] = inf_tps
 
                 wandb.log(log_dict)
                 print(f"Step {step:04d} | Loss {loss.item()*args.accum_steps:.4f} | LR {scheduler.get_last_lr()[0]:.2e} | GradNorm {grad_norm:.2f} | MemPeak {mem_peak:.1f}MB" + (f" | Acc {acc:.4f}" if acc is not None else ""))
 
                 step += 1
+                total_tokens = 0
 
-        if step >= 1500:
+        if step >= args.total_steps:
             break
 
     print("Training complete.")

@@ -6,6 +6,41 @@ from datasets import load_dataset, DatasetDict
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import LoraConfig, get_peft_model
 import random
+import time
+
+def measure_latency(model, dataloader, device, num_batches=20):
+    model.eval()
+    total_time = 0
+    total_tokens = 0
+
+    with torch.no_grad():
+        for i, batch in enumerate(dataloader):
+            if i >= num_batches:
+                break
+
+            torch.cuda.synchronize()
+            start = time.time()
+
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)
+
+            logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+            preds = logits.argmax(dim=-1)
+
+            torch.cuda.synchronize()
+            end = time.time()
+
+            total_time += (end - start)
+
+            if "input_ids" in batch:
+                total_tokens += batch["input_ids"].numel()
+
+    avg_latency = total_time / num_batches
+    tokens_per_sec = total_tokens / total_time
+
+    model.train()
+    return avg_latency, tokens_per_sec
 
 # ---------------- BoolQ ----------------
 def build_boolq_dataset(tokenizer, max_len):
