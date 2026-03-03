@@ -35,7 +35,7 @@ from utils import (
     build_arcc_dataset, arcc_collate_fn, arcc_evaluate, arcc_forward_step,
     build_quality_dataset, quality_collate_fn, quality_forward_step, quality_evaluate,
     build_qasper_dataset, build_hotpotqa_dataset, build_multidoc2dial_dataset,
-    longqa_binary_evaluate, longqa_binary_forward_step, longqa_collate_fn
+    longqa_binary_evaluate, longqa_binary_forward_step, longqa_collate_fn,
     build_subject_dataset, collate_fn_subject, pack_10way_batch, mmlu_forward_step, evaluate_mmlu,
 ) 
 
@@ -64,10 +64,9 @@ def parse_args():
     parser.add_argument("--project", type=str, default="boolq_llama_peft")
     parser.add_argument("--eval_every", type=int, default=200)
     parser.add_argument("--dataset",  type=str, default="boolq",
-                        choices=["boolq", "piqa", "hellaswag", "siqa", "arc_c", "quality", "qasper", "hotpotqa", "multidoc2dial"])
+                        choices=["boolq", "piqa", "hellaswag", "siqa", "arc_c", "quality", "qasper", "hotpotqa", "multidoc2dial", "business", "biology", "law", "economics", "history", "physics","health", "math", "computer science"])
     parser.add_argument("--num_samples", type=int, default=-1, help="Num training samples (-1 for full)")
     parser.add_argument("--zero_shot", action="store_true", help="Run eval and exit")
-                        choices=["boolq", "piqa", "hellaswag", "business", "biology", "law", "economics", "history", "physics","health", "math", "computer science"])
 
     return parser.parse_args()
 
@@ -361,8 +360,12 @@ def main():
                 pad_id = model.config.pad_token_id
                 ids, _, _ = pack_10way_batch(batch, device, pad_id)
                 total_tokens += ids.numel()
-            else:
+            elif "input_ids" in batch:
                 total_tokens += batch["input_ids"].numel()
+            else:
+                choice_keys = [k for k in batch.keys() if k.startswith("input_ids_")]
+                for key in choice_keys:
+                    total_tokens += batch[key].numel()
 
             loss = forward_step(args.accum_steps, model, batch, device)
             loss.backward()
