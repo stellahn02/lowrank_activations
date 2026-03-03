@@ -26,8 +26,14 @@ from tqdm import tqdm
 from utils import ( 
     build_boolq_dataset, boolq_collate_fn, boolq_evaluate, boolq_forward_step,
     build_piqa_dataset, piqa_collate_fn, piqa_forward_step, piqa_evaluate,
-    build_hellaswag_dataset, hellaswag_collate_fn, hellaswag_forward_step, hellaswag_evaluate
+    build_hellaswag_dataset, hellaswag_collate_fn, hellaswag_forward_step, hellaswag_evaluate,
+    build_siqa_dataset, siqa_collate_fn, siqa_forward_step, siqa_evaluate,
+    build_arcc_dataset, arcc_collate_fn, arcc_evaluate, arcc_forward_step,
+    build_quality_dataset, quality_collate_fn, quality_forward_step, quality_evaluate,
+    build_qasper_dataset, build_hotpotqa_dataset, build_multidoc2dial_dataset,
+    longqa_binary_evaluate, longqa_binary_forward_step, longqa_collate_fn
 ) 
+
 # -------------------------
 # Argument Parser
 # -------------------------
@@ -51,7 +57,9 @@ def parse_args():
     parser.add_argument("--project", type=str, default="boolq_llama_peft")
     parser.add_argument("--eval_every", type=int, default=200)
     parser.add_argument("--dataset",  type=str, default="boolq",
-                        choices=["boolq", "piqa", "hellaswag"])
+                        choices=["boolq", "piqa", "hellaswag", "siqa", "arc_c", "quality", "qasper", "hotpotqa", "multidoc2dial"])
+    parser.add_argument("--num_samples", type=int, default=-1, help="Num training samples (-1 for full)")
+    parser.add_argument("--zero_shot", action="store_true", help="Run eval and exit")
 
     return parser.parse_args()
 
@@ -109,7 +117,7 @@ def get_peft_config(method):
         target_modules= "all-linear",
         fan_in_fan_out=False,              # use fan-in scaling, optional
         rank=8,
-        learned_pooling=False,    
+        learned_pooling=True,    
     )
 
 
@@ -134,6 +142,36 @@ def get_dataset(dataset_name, tokenizer, max_len):
         collate_fn = hellaswag_collate_fn
         forward_step = hellaswag_forward_step     
     
+    if dataset_name == "siqa":
+        dataset = build_siqa_dataset(tokenizer, max_len)
+        evaluate_fn = siqa_evaluate
+        collate_fn = siqa_collate_fn
+        forward_step = siqa_forward_step
+
+    if dataset_name == "arc_c":
+        dataset = build_arcc_dataset(tokenizer, max_len)
+        evaluate_fn = arcc_evaluate
+        collate_fn = arcc_collate_fn
+        forward_step = arcc_forward_step
+    
+    if dataset_name == "quality":
+        dataset = build_quality_dataset(tokenizer, max_len)
+        evaluate_fn = quality_evaluate
+        collate_fn = quality_collate_fn
+        forward_step = quality_forward_step
+
+    elif dataset_name in ["qasper", "hotpotqa", "multidoc2dial"]:
+        if dataset_name == "qasper":
+            dataset = build_qasper_dataset(tokenizer, max_len)
+        elif dataset_name == "hotpotqa":
+            dataset = build_hotpotqa_dataset(tokenizer, max_len)
+        else:
+            dataset = build_multidoc2dial_dataset(tokenizer, max_len)
+        
+        evaluate_fn = longqa_binary_evaluate
+        collate_fn = longqa_collate_fn
+        forward_step = longqa_binary_forward_step
+                
     return dataset, evaluate_fn, collate_fn, forward_step
 
 def get_lr(method):
@@ -201,12 +239,40 @@ def main():
     # dataset = build_boolq_dataset(tokenizer, args.max_len)
     dataset, evaluate_fn, collate_fn, forward_step = get_dataset(args.dataset, tokenizer, args.max_len)
 
+    if args.num_samples > 0:
+        dataset["train"] = dataset["train"].shuffle(seed=42).select(range(min(args.num_samples, len(dataset["train"]))))
+        print(f"Dataset sampled to {len(dataset['train'])} examples.")
+    
+    actual_num_samples = len(dataset["train"])
+    print(f">>> Training on {actual_num_samples} samples.")
+    wandb.log({"num_samples": actual_num_samples})
+
     train_loader = DataLoader(dataset["train"], batch_size=args.batch_size,
                               shuffle=True, collate_fn=lambda b: collate_fn(b, tokenizer.pad_token_id),)
     val_loader = DataLoader(dataset["validation"], batch_size=args.batch_size,
                             shuffle=False, collate_fn=lambda b: collate_fn(b, tokenizer.pad_token_id),)
 
     model.config.pad_token_id = tokenizer.pad_token_id
+
+    # zero-shot
+    if args.zero_shot:
+        model.to(device)
+        model.eval()
+        acc = evaluate_fn(model, val_loader, device)
+        wandb.log({"acc": acc, "num_samples": 0})
+        return 
+    
+    # dynamic training steps
+    steps_per_epoch = len(train_loader) // args.accum_steps
+    if steps_per_epoch == 0: 
+        steps_per_epoch = 1
+
+    # if 0 < args.num_samples < 5000:
+    #     max_steps = steps_per_epoch * args.epochs
+    # else:
+    #     max_steps = 1500
+    
+    # print(f">>> Training for {max_steps} total steps.")
 
     if args.checkpointing:
         model.gradient_checkpointing_enable()
@@ -256,6 +322,9 @@ def main():
     optimizer.zero_grad()
     torch.cuda.reset_peak_memory_stats()  # reset memory stats at the start of training
     torch.cuda.empty_cache()  # clear any cached memory
+
+    # adaptive_eval = max(5, max_steps // 5)
+
     for epoch in range(1000):
         for batch_idx, batch in enumerate(train_loader):
             if step >= 1500:
@@ -277,7 +346,7 @@ def main():
 
                 # evaluate only every 50 steps
                 acc = None
-                if step % 50 == 0 and step > 0:
+                if  step % 50 == 0 and step > 0:
                     acc = evaluate_fn(model, val_loader, device)
 
                 log_dict = {
