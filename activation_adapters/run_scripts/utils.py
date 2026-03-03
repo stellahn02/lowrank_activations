@@ -1,6 +1,46 @@
+
 import torch
-from datasets import load_dataset
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from datasets import load_dataset, DatasetDict
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from peft import LoraConfig, get_peft_model
+import random
+import time
+
+def measure_latency(model, dataloader, device, num_batches=20):
+    model.eval()
+    total_time = 0
+    total_tokens = 0
+
+    with torch.no_grad():
+        for i, batch in enumerate(dataloader):
+            if i >= num_batches:
+                break
+
+            torch.cuda.synchronize()
+            start = time.time()
+
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)
+
+            logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+            preds = logits.argmax(dim=-1)
+
+            torch.cuda.synchronize()
+            end = time.time()
+
+            total_time += (end - start)
+
+            if "input_ids" in batch:
+                total_tokens += batch["input_ids"].numel()
+
+    avg_latency = total_time / num_batches
+    tokens_per_sec = total_tokens / total_time
+
+    model.train()
+    return avg_latency, tokens_per_sec
 
 # ---------------- BoolQ ----------------
 def build_boolq_dataset(tokenizer, max_len):
@@ -12,7 +52,8 @@ def build_boolq_dataset(tokenizer, max_len):
             text,
             truncation=True,
             max_length=max_len,
-            padding=False,
+            padding=False, # Dynamic Padding
+            # padding="max_length", # Static Padding
         )
         return {
             "input_ids": enc["input_ids"],
@@ -617,3 +658,177 @@ def longqa_binary_evaluate(model, dev_loader, device):
     model.train()
     return correct / total
 
+
+# ---------------- MMLU ----------------
+
+def build_subject_dataset(tokenizer, max_len, subject):
+    ds = load_dataset("TIGER-Lab/MMLU-Pro")
+    biology_test = ds["test"].filter(lambda x: x["category"] == subject)
+
+    split = biology_test.train_test_split(test_size=0.1)
+    train_ds, val_ds = split["train"], split["test"]
+
+    ds_filtered = DatasetDict({"train": train_ds, "validation": val_ds})
+
+    def preprocess(ex):
+        question = ex["question"]
+        label = int(ex["answer_index"])
+        choices = ex["options"]
+        choices = choices[:10] + [""] * (10 - len(choices))  # ensure 10 choices
+
+        shuffled_idx = list(range(10))
+        random.shuffle(shuffled_idx)
+        shuffled_choices = [choices[i] for i in shuffled_idx]
+        label = shuffled_idx.index(label)
+
+        out = {"labels": label}
+        for i in range(10):
+            # Prompt with context
+            prompt = (
+                f"You are a highly knowledgeable expert in {subject}. Read the question carefully and choose the best answer. Explain your reasoning briefly before answering."
+                f"Question: {question}\nChoices:\n" +
+                "\n".join([f"{j+1}. {c}" for j, c in enumerate(shuffled_choices)]) +
+                "\nAnswer:"
+            )
+            full_text = prompt + f" {shuffled_choices[i]}"
+
+            enc_full = tokenizer(full_text, truncation=True, max_length=max_len, padding="max_length")
+            enc_prompt = tokenizer(prompt, truncation=True, max_length=max_len, padding=False)
+            prompt_len = len(enc_prompt["input_ids"])
+
+            out[f"input_ids_{i}"] = enc_full["input_ids"]
+            out[f"attention_mask_{i}"] = enc_full["attention_mask"]
+            out[f"prompt_len_{i}"] = prompt_len
+        return out
+
+    for split_name in ["train", "validation"]:
+        ds_filtered[split_name] = ds_filtered[split_name].map(
+            preprocess,
+            remove_columns=ds_filtered[split_name].column_names
+        ).filter(lambda x: x is not None)
+
+    return ds_filtered
+
+# -----------------------------
+# Collate function
+# -----------------------------
+def collate_fn_subject(batch, pad_id):
+    def pad(seqs):
+        maxlen = max(len(s) for s in seqs)
+        return [s + [pad_id]*(maxlen-len(s)) for s in seqs]
+
+    out = {}
+    for i in range(10):
+        ids = pad([x[f"input_ids_{i}"] for x in batch])
+        msk = pad([x[f"attention_mask_{i}"] for x in batch])
+        out[f"input_ids_{i}"] = torch.tensor(ids, dtype=torch.long)
+        out[f"attention_mask_{i}"] = torch.tensor(msk, dtype=torch.long)
+        out[f"prompt_len_{i}"] = torch.tensor([x[f"prompt_len_{i}"] for x in batch], dtype=torch.long)
+    out["labels"] = torch.tensor([x["labels"] for x in batch], dtype=torch.long)
+    return out
+
+# -----------------------------
+# Pack 10-way batch for model
+# -----------------------------
+def pack_10way_batch(batch, device, pad_id):
+    input_ids_list, attention_mask_list, prompt_len_list = [], [], []
+    max_len = max(batch[f"input_ids_{i}"].size(1) for i in range(10))
+
+    for i in range(10):
+        ids, msk = batch[f"input_ids_{i}"], batch[f"attention_mask_{i}"]
+        B, T = ids.shape
+        if T < max_len:
+            pad_len = max_len - T
+            ids = torch.cat([ids, torch.full((B, pad_len), pad_id, dtype=ids.dtype)], dim=1)
+            msk = torch.cat([msk, torch.zeros((B, pad_len), dtype=msk.dtype)], dim=1)
+        input_ids_list.append(ids)
+        attention_mask_list.append(msk)
+        prompt_len_list.append(batch[f"prompt_len_{i}"])
+
+    ids = torch.cat(input_ids_list, dim=0).to(device)
+    msk = torch.cat(attention_mask_list, dim=0).to(device)
+    prompt_lens = torch.cat(prompt_len_list, dim=0).to(device)
+    return ids, msk, prompt_lens
+
+# -----------------------------
+# Forward + LoRA loss
+# -----------------------------
+def mmlu_forward_step(accum_steps, model, batch, device):
+    pad_id = model.config.pad_token_id
+    ids, msk, prompt_lens = pack_10way_batch(batch, device, pad_id)
+    B = batch["labels"].size(0)
+    labels = batch["labels"].to(device)
+
+    outputs = model(input_ids=ids, attention_mask=msk)
+    logits = outputs.logits
+    shift_logits = logits[:, :-1, :]
+    shift_labels = ids[:, 1:]
+    log_probs = F.log_softmax(shift_logits, dim=-1)
+    token_log_probs = log_probs.gather(-1, shift_labels.unsqueeze(-1)).squeeze(-1)
+
+    # Compute NLL per choice
+    losses_per_choice = []
+    for i in range(10):
+        choice_losses = []
+        for b in range(B):
+            idx = b + i*B
+            start = prompt_lens[idx] - 1
+            tokens = shift_labels[idx, start:] != pad_id
+            masked_tokens = token_log_probs[idx, start:][tokens]
+            if masked_tokens.numel() > 0:
+                choice_losses.append(-masked_tokens.sum() / masked_tokens.numel())
+            else:
+                choice_losses.append(torch.tensor(0.0, device=device, requires_grad=True))
+        losses_per_choice.append(torch.stack(choice_losses))
+    nlls = torch.stack(losses_per_choice, dim=1)  # [B, 10]
+    scores = -nlls
+    # return F.cross_entropy(scores, labels) / accum_steps
+
+    targets = F.one_hot(labels, num_classes=10).float()
+    targets = targets * 0.9 + 0.1 / 10  # 0.9 confidence + 0.1 smoothing
+    loss = -(F.log_softmax(scores, dim=-1) * targets).sum(dim=-1).mean()
+    return loss / accum_steps
+
+# -----------------------------
+# Evaluation
+# -----------------------------
+@torch.no_grad()
+def evaluate_mmlu(model, dataloader, device):
+    model.eval()
+    correct, total = 0, 0
+    pad_id = model.config.pad_token_id
+
+    for batch in dataloader:
+        B = batch["labels"].size(0)
+        labels = batch["labels"].to(device)
+        ids, msk, prompt_lens = pack_10way_batch(batch, device, pad_id)
+
+        outputs = model(input_ids=ids, attention_mask=msk)
+        logits = outputs.logits
+        shift_logits = logits[:, :-1, :]
+        shift_labels = ids[:, 1:]
+        log_probs = F.log_softmax(shift_logits, dim=-1)
+        token_log_probs = log_probs.gather(-1, shift_labels.unsqueeze(-1)).squeeze(-1)
+
+        # NLL per choice
+        losses_per_choice = []
+        for i in range(10):
+            choice_losses = []
+            for b in range(B):
+                idx = b + i*B
+                start = prompt_lens[idx] - 1
+                masked_tokens = token_log_probs[idx, start:][shift_labels[idx, start:] != pad_id]
+                if masked_tokens.numel() == 0:
+                    choice_losses.append(torch.tensor(0.0, device=device))
+                else:
+                    choice_losses.append(-masked_tokens.mean())
+            losses_per_choice.append(torch.stack(choice_losses))
+        nlls = torch.stack(losses_per_choice, dim=1)
+        preds = nlls.argmin(dim=1)
+        correct += (preds == labels).sum().item()
+        total += B
+
+    acc = correct / total
+    # print(f"Subject Accuracy: {acc*100:.2f}%")
+    model.train()
+    return acc
