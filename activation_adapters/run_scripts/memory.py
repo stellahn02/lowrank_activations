@@ -12,7 +12,8 @@ from transformers import (
     AutoModelForSequenceClassification,
     get_cosine_schedule_with_warmup,
     LlamaForCausalLM,
-    AutoModelForCausalLM
+    AutoModelForCausalLM,
+    BitsAndBytesConfig
 )
 from peft import (
     LoraConfig,
@@ -34,8 +35,7 @@ from utils import (
     build_siqa_dataset, siqa_collate_fn, siqa_forward_step, siqa_evaluate,
     build_arcc_dataset, arcc_collate_fn, arcc_evaluate, arcc_forward_step,
     build_quality_dataset, quality_collate_fn, quality_forward_step, quality_evaluate,
-    build_qasper_dataset, build_hotpotqa_dataset, build_multidoc2dial_dataset,
-    longqa_binary_evaluate, longqa_binary_forward_step, longqa_collate_fn,
+    build_race_dataset, race_collate_fn, race_forward_step, race_evaluate, race_evaluate_verbose,
     build_subject_dataset, collate_fn_subject, pack_10way_batch, mmlu_forward_step, evaluate_mmlu,
 ) 
 
@@ -64,9 +64,13 @@ def parse_args():
     parser.add_argument("--project", type=str, default="boolq_llama_peft")
     parser.add_argument("--eval_every", type=int, default=200)
     parser.add_argument("--dataset",  type=str, default="boolq",
-                        choices=["boolq", "piqa", "hellaswag", "siqa", "arc_c", "quality", "qasper", "hotpotqa", "multidoc2dial", "business", "biology", "law", "economics", "history", "physics","health", "math", "computer science"])
+                        choices=["boolq", "piqa", "hellaswag", "siqa", "arc_c", "quality","race", "business", "biology", "law", "economics", "history", "physics","health", "math", "computer science"])
     parser.add_argument("--num_samples", type=int, default=-1, help="Num training samples (-1 for full)")
     parser.add_argument("--zero_shot", action="store_true", help="Run eval and exit")
+    parser.add_argument("--quantization", type=str, default=None, 
+                        choices=["4bit", "8bit"], help="Quantization mode")
+    parser.add_argument("--max_grad_norm", type=float, default=1.0, 
+                        help="Threshold for gradient clipping (set lower for 4-bit stability)")
 
     return parser.parse_args()
 
@@ -75,7 +79,7 @@ def parse_args():
 # -------------------------
 # PEFT Config Factory
 # -------------------------
-def get_peft_config(method, rank, total_steps):
+def get_peft_config(method, rank, total_steps, task_type):
 
     if method == "lora":
         return LoraConfig(
@@ -83,7 +87,7 @@ def get_peft_config(method, rank, total_steps):
             lora_alpha=16,
             target_modules="all-linear",
             lora_dropout=0.05,
-            task_type=TaskType.SEQ_CLS,
+            task_type=task_type,
         )
 
     elif method == "adalora":
@@ -92,27 +96,27 @@ def get_peft_config(method, rank, total_steps):
             target_r=4,
             init_r=8,
             lora_alpha=16,
-            task_type=TaskType.SEQ_CLS,
             total_step=total_steps,
             target_modules="all-linear",
+            task_type=task_type,
         )
 
     elif method == "ia3":
         return IA3Config(
-            task_type=TaskType.SEQ_CLS,
             target_modules="all-linear",
+            task_type=task_type,
         )
 
     elif method == "prefix":
         return PrefixTuningConfig(
             num_virtual_tokens=20,
-            task_type=TaskType.SEQ_CLS,
+            task_type=task_type,
         )
 
     elif method == "prompt":
         return PromptTuningConfig(
             num_virtual_tokens=20,
-            task_type=TaskType.SEQ_CLS,
+            task_type=task_type,
         )
 
     elif method == "bitfit":
@@ -120,17 +124,17 @@ def get_peft_config(method, rank, total_steps):
 
     elif method == "lars":
         return LARSConfig(
-        task_type=TaskType.SEQ_CLS,   # sequence classification
         target_modules= "all-linear",
         fan_in_fan_out=False,              # use fan-in scaling, optional
         rank=rank,
-        learned_pooling=False,    
+        learned_pooling=False, 
+        task_type=task_type, 
     )
 
 
 def get_dataset(dataset_name, tokenizer, max_len):
     dataset, evaluate_fn, collate_fn, forward_step = None, None, None, None
-    
+
     if dataset_name == "boolq":
         dataset = build_boolq_dataset(tokenizer, max_len)
         evaluate_fn = boolq_evaluate
@@ -171,20 +175,14 @@ def get_dataset(dataset_name, tokenizer, max_len):
         dataset = build_quality_dataset(tokenizer, max_len)
         evaluate_fn = quality_evaluate
         collate_fn = quality_collate_fn
-        forward_step = quality_forward_step
+        forward_step = quality_forward_step    
+    
+    if dataset_name == "race":
+        dataset = build_race_dataset(tokenizer, max_len)
+        evaluate_fn = race_evaluate
+        collate_fn = race_collate_fn
+        forward_step = race_forward_step
 
-    elif dataset_name in ["qasper", "hotpotqa", "multidoc2dial"]:
-        if dataset_name == "qasper":
-            dataset = build_qasper_dataset(tokenizer, max_len)
-        elif dataset_name == "hotpotqa":
-            dataset = build_hotpotqa_dataset(tokenizer, max_len)
-        else:
-            dataset = build_multidoc2dial_dataset(tokenizer, max_len)
-        
-        evaluate_fn = longqa_binary_evaluate
-        collate_fn = longqa_collate_fn
-        forward_step = longqa_binary_forward_step
-                
     return dataset, evaluate_fn, collate_fn, forward_step
 
 def get_lr(method):
@@ -224,6 +222,18 @@ def main():
     # os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    bnb_config = None
+    if args.quantization == "4bit":
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16, # Optimized for L40S
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+        )
+    elif args.quantization == "8bit":
+        bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+
+
     wandb.init(project=args.project, config=vars(args))
 
     MODEL_MAP = {
@@ -232,7 +242,7 @@ def main():
     }
     model_id = MODEL_MAP[args.model_name]
 
-    if args.dataset in ["biology", "business", "law", "economics", "history", "physics", "health", "math", "computer science"]:
+    if args.dataset in ["biology", "business", "law", "economics", "history", "physics", "health", "math", "computer science", "quality", "race"]:
         if args.model_name == "llama":
             model = LlamaForCausalLM.from_pretrained(
                 model_id,
@@ -246,11 +256,13 @@ def main():
             model = LlamaForSequenceClassification.from_pretrained(
                 model_id,
                 num_labels=2,
+                quantization_config=bnb_config,
             )
         else: #qwen
             model = AutoModelForSequenceClassification.from_pretrained(
                 model_id,
                 num_labels=2,
+                quantization_config=bnb_config,
                 device_map={"": 0},
                 torch_dtype=torch.bfloat16,
                 trust_remote_code=True
@@ -271,7 +283,8 @@ def main():
     wandb.log({"num_samples": actual_num_samples})
 
     train_loader = DataLoader(dataset["train"], batch_size=args.batch_size,
-                              shuffle=True, collate_fn=lambda b: collate_fn(b, tokenizer.pad_token_id),)
+                              shuffle=True, collate_fn=lambda b: collate_fn(b, tokenizer.pad_token_id))
+
     val_loader = DataLoader(dataset["validation"], batch_size=args.batch_size,
                             shuffle=False, collate_fn=lambda b: collate_fn(b, tokenizer.pad_token_id),)
 
@@ -300,6 +313,14 @@ def main():
     if args.checkpointing:
         model.gradient_checkpointing_enable()
         model.config.use_cache = False
+    
+    causal_datasets = [
+    "biology", "business", "law", "economics", "history",
+    "physics", "health", "math", "computer science",
+    "quality", "race"
+    ]
+
+    task_type = TaskType.CAUSAL_LM if args.dataset in causal_datasets else TaskType.SEQ_CLS
 
     # Apply PEFT
     if args.peft_method == "bitfit":
@@ -307,16 +328,33 @@ def main():
     elif args.peft_method == "full":
         pass  # fine-tune all parameters, no adapter
     else:
-        peft_config = get_peft_config(args.peft_method, args.rank, args.total_steps)
+        peft_config = get_peft_config(args.peft_method, args.rank, args.total_steps, task_type)
         model = get_peft_model(model, peft_config)
 
     if args.model_name == "qwen":
         model.to(torch.bfloat16)
+
+    if args.model_name == "qwen":
         if hasattr(model, "score"):
             model.score.to(torch.bfloat16)
 
     args.lr = get_lr(args.peft_method)
-    model.to(device)
+    if getattr(model, "is_loaded_in_4bit", False) or getattr(model, "is_loaded_in_8bit", False):
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                param.data = param.data.to(device)
+        
+        if hasattr(model, "modules_to_save") and isinstance(model.modules_to_save, set):
+            for name, module in model.named_modules():
+                if any(save_name in name for save_name in model.modules_to_save):
+                    module.to(torch.bfloat16)
+                    print(f"Aligned {name} to bfloat16")
+
+        if hasattr(model, "score"):
+            model.score.to(torch.bfloat16)
+    else:
+        model.to(device)
+
 
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
@@ -352,7 +390,7 @@ def main():
     for epoch in range(1000):
         for batch_idx, batch in enumerate(train_loader):
             start_time = time.time()
-            
+
             if step >= args.total_steps:
                 break
 
@@ -372,7 +410,7 @@ def main():
 
             # inside the accumulation step
             if (batch_idx + 1) % args.accum_steps == 0:
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
@@ -389,9 +427,8 @@ def main():
 
                 if step % 50 == 0 and step > 0:
                     acc = evaluate_fn(model, val_loader, device)
-                    if step % 100 == 0 and latency is None and args.dataset in ["boolq"]:
-                        latency, inf_tps = measure_latency(model, val_loader, device)
-
+                    # if step % 100 == 0 and latency is None and args.dataset in ["boolq"]:
+                    #     latency, inf_tps = measure_latency(model, val_loader, device)
 
                 log_dict = {
                     "loss": float(loss.item() * args.accum_steps),

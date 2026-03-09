@@ -1,12 +1,18 @@
 
 import torch
 import torch.nn.functional as F
+import string
+import json
+import re
 from torch.utils.data import DataLoader
-from datasets import load_dataset, DatasetDict
+from datasets import load_dataset, DatasetDict, concatenate_datasets, Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import LoraConfig, get_peft_model
 import random
 import time
+import collections
+from collections import Counter
+
 
 def measure_latency(model, dataloader, device, num_batches=20):
     model.eval()
@@ -79,17 +85,18 @@ def boolq_collate_fn(batch, pad_id):
 def boolq_evaluate(model, dev_loader, device):
     model.eval()
     correct = total = 0
+    
+    with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+        for batch in dev_loader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)
 
-    for batch in dev_loader:
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        labels = batch["labels"].to(device)
+            logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+            preds = logits.argmax(dim=-1)
 
-        logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
-        preds = logits.argmax(dim=-1)
-
-        correct += (preds == labels).sum().item()
-        total += labels.size(0)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
 
     model.train()
     return correct / total
@@ -98,7 +105,8 @@ def boolq_forward_step(accum_steps, model, batch, device):
     input_ids = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
     labels = batch["labels"].to(device)
-    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
     return outputs.loss / accum_steps
 
 
@@ -538,126 +546,466 @@ def pad_sequence(seqs, pad_val):
     return [s + [pad_val] * (maxlen - len(s)) for s in seqs]
 
 # ---------------- QuALITY ----------------
+
 def build_quality_dataset(tokenizer, max_len):
     ds = load_dataset("emozilla/quality", "default")
+
     def preprocess(ex):
         question = ex["question"]
         article = ex["article"]
-        out = {"labels": ex["answer"]}
-        for i in range(4):
-            text = f"Context: {article}\nQuestion: {question}\nAnswer: {ex['options'][i]}"
-            enc = tokenizer(text, truncation=True, max_length=max_len, padding=False)
-            out[f"input_ids_{i}"] = enc["input_ids"]
-            out[f"attention_mask_{i}"] = enc["attention_mask"]
-            out[f"len_{i}"] = len(enc["input_ids"])
+        options = ex["options"]
+        label = int(ex["answer"])
+
+        out = {"labels": label}
+
+        old_side = tokenizer.truncation_side
+        tokenizer.truncation_side = "left"
+        try:
+            for i in range(4):
+                prompt = f"{article}\n\nQuestion: {question}\nAnswer:"
+                enc_prompt = tokenizer(prompt, add_special_tokens=False)
+
+                ans_text = " " + options[i]
+                enc_ans = tokenizer(ans_text, add_special_tokens=False)
+
+                max_prompt = max_len - len(enc_ans["input_ids"]) - 1
+                if max_prompt < 32:
+                    max_prompt = 32
+
+                prompt_ids = enc_prompt["input_ids"][-max_prompt:]
+                input_ids = prompt_ids + enc_ans["input_ids"]
+                input_ids = input_ids[:max_len]
+
+                out[f"input_ids_{i}"] = input_ids
+                out[f"attention_mask_{i}"] = [1] * len(input_ids)
+                out[f"prompt_len_{i}"] = min(len(prompt_ids), len(input_ids))
+        finally:
+            tokenizer.truncation_side = old_side
+
         return out
-    return ds.map(preprocess, remove_columns=ds["train"].column_names)
+
+    return ds.map(
+        preprocess,
+        remove_columns=ds["train"].column_names,
+        num_proc=12,
+    )
+
 
 def quality_collate_fn(batch, pad_id):
-    out = {"labels": torch.tensor([x["labels"] for x in batch], dtype=torch.long)}
+    def pad_sequence(seqs, pad_val):
+        maxlen = max(len(s) for s in seqs)
+        return [s + [pad_val] * (maxlen - len(s)) for s in seqs]
+
+    out = {
+        "labels": torch.tensor([x["labels"] for x in batch], dtype=torch.long)
+    }
+
     for i in range(4):
-        out[f"input_ids_{i}"] = torch.tensor(pad_sequence([x[f"input_ids_{i}"] for x in batch], pad_id), dtype=torch.long)
-        out[f"attention_mask_{i}"] = torch.tensor(pad_sequence([x[f"attention_mask_{i}"] for x in batch], 0), dtype=torch.long)
-        out[f"len_{i}"] = torch.tensor([x[f"len_{i}"] for x in batch], dtype=torch.float)
+        ids_list = [x[f"input_ids_{i}"] for x in batch]
+        msk_list = [x[f"attention_mask_{i}"] for x in batch]
+
+        out[f"input_ids_{i}"] = torch.tensor(
+            pad_sequence(ids_list, pad_id), dtype=torch.long
+        )
+        out[f"attention_mask_{i}"] = torch.tensor(
+            pad_sequence(msk_list, 0), dtype=torch.long
+        )
+        out[f"prompt_len_{i}"] = torch.tensor(
+            [x[f"prompt_len_{i}"] for x in batch], dtype=torch.long
+        )
+
     return out
+
+
+def quality_pack_4way_batch(batch, device, pad_id):
+    input_ids_list = []
+    attention_mask_list = []
+
+    max_t = max(batch[f"input_ids_{i}"].size(1) for i in range(4))
+
+    for i in range(4):
+        ids = batch[f"input_ids_{i}"]
+        msk = batch[f"attention_mask_{i}"]
+        B, T = ids.shape
+
+        if T < max_t:
+            padding_len = max_t - T
+            ids = torch.cat(
+                [ids, torch.full((B, padding_len), pad_id, dtype=torch.long)], dim=1
+            )
+            msk = torch.cat(
+                [msk, torch.zeros((B, padding_len), dtype=torch.long)], dim=1
+            )
+
+        input_ids_list.append(ids)
+        attention_mask_list.append(msk)
+
+    ids = torch.cat(input_ids_list, dim=0).to(device)   # [4B, T]
+    msk = torch.cat(attention_mask_list, dim=0).to(device)  # [4B, T]
+    return ids, msk
+
 
 def quality_forward_step(accum_steps, model, batch, device):
     pad_id = model.config.pad_token_id
-    ids, msk, lens = pack_4way_batch(batch, device, pad_id)
+    ids, msk = quality_pack_4way_batch(batch, device, pad_id)
+
     B = batch["labels"].size(0)
-    
-    logits = model(input_ids=ids, attention_mask=msk).logits
-    scores = (logits[:, 1] - logits[:, 0]) / (lens + 1e-8)
-    
-    scores_4way = scores.view(4, B).transpose(0, 1).contiguous()
-    return F.cross_entropy(scores_4way, batch["labels"].to(device)) / accum_steps
+    labels = batch["labels"].to(device)
+    prompt_lens = torch.cat([batch[f"prompt_len_{i}"] for i in range(4)], dim=0).to(device)
+
+    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+        logits = model(input_ids=ids, attention_mask=msk).logits   # [4B, T, V]
+
+    shift_logits = logits[:, :-1, :]
+    shift_ids = ids[:, 1:]                  # tokens being predicted
+    shift_msk = msk[:, 1:].float()
+
+    log_probs = F.log_softmax(shift_logits, dim=-1)
+    tok_logp = log_probs.gather(-1, shift_ids.unsqueeze(-1)).squeeze(-1)  # [4B, T-1]
+
+    Tm1 = shift_ids.size(1)
+    positions = torch.arange(Tm1, device=device).unsqueeze(0)  # [1, T-1]
+
+    # answer starts at token index prompt_len in ids space,
+    # so in shifted space it starts at prompt_len - 1
+    answer_mask = (positions >= (prompt_lens.unsqueeze(1) - 1)).float()
+    answer_mask = answer_mask * shift_msk
+
+    sum_logp = (tok_logp * answer_mask).sum(dim=1)      # [4B]
+    cnt = answer_mask.sum(dim=1).clamp_min(1.0)         # [4B]
+    nll = -(sum_logp / cnt)                             # [4B]
+
+    scores = (-nll).view(4, B).transpose(0, 1).contiguous()   # [B, 4]
+    loss = F.cross_entropy(scores, labels)
+
+    return loss / accum_steps
+
 
 @torch.no_grad()
 def quality_evaluate(model, dev_loader, device):
     model.eval()
     correct = total = 0
     pad_id = model.config.pad_token_id
-    for batch in dev_loader:
-        B = batch["labels"].size(0)
-        ids, msk, lens = pack_4way_batch(batch, device, pad_id)
-        
-        logits = model(input_ids=ids, attention_mask=msk).logits
-        scores = (logits[:, 1] - logits[:, 0]) / lens
-        preds = scores.view(4, B).transpose(0, 1).argmax(dim=1)
-        
-        correct += (preds == batch["labels"].to(device)).sum().item()
-        total += B
+
+    with torch.inference_mode():
+        for batch in dev_loader:
+            ids, msk = quality_pack_4way_batch(batch, device, pad_id)
+
+            B = batch["labels"].size(0)
+            labels = batch["labels"].to(device)
+            prompt_lens = torch.cat([batch[f"prompt_len_{i}"] for i in range(4)], dim=0).to(device)
+
+            logits = model(input_ids=ids, attention_mask=msk).logits
+
+            shift_logits = logits[:, :-1, :]
+            shift_ids = ids[:, 1:]
+            shift_msk = msk[:, 1:].float()
+
+            log_probs = F.log_softmax(shift_logits, dim=-1)
+            tok_logp = log_probs.gather(-1, shift_ids.unsqueeze(-1)).squeeze(-1)
+
+            Tm1 = shift_ids.size(1)
+            positions = torch.arange(Tm1, device=device).unsqueeze(0)
+            answer_mask = (positions >= (prompt_lens.unsqueeze(1) - 1)).float()
+            answer_mask = answer_mask * shift_msk
+
+            sum_logp = (tok_logp * answer_mask).sum(dim=1)
+            cnt = answer_mask.sum(dim=1).clamp_min(1.0)
+            nll = -(sum_logp / cnt)
+
+            scores = (-nll).view(4, B).transpose(0, 1).contiguous()
+            preds = scores.argmax(dim=1)
+
+            correct += (preds == labels).sum().item()
+            total += B
+
+            del logits, shift_logits, log_probs, tok_logp, nll, scores
+
     model.train()
     return correct / total
 
-# ---------------- Qasper ----------------
-def build_qasper_dataset(tokenizer, max_len):
-    ds = load_dataset("allenai/qasper")
+# ---------------- RACE ----------------
+
+def build_race_dataset(tokenizer, max_len, subset="all", limit_train=None, limit_val=None):
+    ds = load_dataset("race", subset)
+
+    if limit_train is not None and limit_train > 0:
+        ds["train"] = ds["train"].select(range(min(limit_train, len(ds["train"]))))
+
+    if limit_val is not None and limit_val > 0:
+        ds["validation"] = ds["validation"].select(range(min(limit_val, len(ds["validation"]))))
+
+    answer_map = {"A": 0, "B": 1, "C": 2, "D": 3}
+
     def preprocess(ex):
+        article = ex["article"]
         question = ex["question"]
-        full_text = " ".join([" ".join(p) for p in ex["full_text"]["paragraphs"]])
-        enc = tokenizer(f"Question: {question}\nContext: {full_text}", truncation=True, max_length=max_len)
-        return {"input_ids": enc["input_ids"], "attention_mask": enc["attention_mask"], 
-                "labels": 0 if ex["answers"][0]["answer"][0]["unanswerable"] else 1}
-    return ds.map(preprocess, remove_columns=ds["train"].column_names)
+        options = ex["options"]
+        answer = ex["answer"]
 
-# ---------------- HotpotQA  ----------------
-def build_hotpotqa_dataset(tokenizer, max_len):
-    ds = load_dataset("hotpot_qa", "distractor")
-    def preprocess(ex):
-        question = ex["question"]
-        full_ctx = " ".join([" ".join(p) for p in ex["context"]["sentences"]])
-        enc = tokenizer(f"Question: {question}\nContext: {full_ctx}", truncation=True, max_length=max_len)
-        return {"input_ids": enc["input_ids"], "attention_mask": enc["attention_mask"],
-                "labels": 1 if ex["answer"].lower() == "yes" else 0}
-    return ds.map(preprocess, remove_columns=ds["train"].column_names)
+        if options is None or len(options) != 4:
+            return {"keep": False}
 
-# ---------------- MultiDoc2Dial  ----------------
-def build_multidoc2dial_dataset(tokenizer, max_len):
-    ds = load_dataset("multidoc2dial", "multidoc2dial")
-    def preprocess(ex):
-        enc = tokenizer(f"Question: {ex['question']}\nDoc: {ex['context']}", truncation=True, max_length=max_len)
-        return {"input_ids": enc["input_ids"], "attention_mask": enc["attention_mask"], "labels": 0}
-    return ds.map(preprocess, remove_columns=ds["train"].column_names)
+        if answer not in answer_map:
+            return {"keep": False}
 
-# ---------------- Shared Logic for Binary Long-QA ----------------
-def longqa_collate_fn(batch, pad_id):
-    # binary collation for HotpotQA, Qasper, MultiDoc2Dial, BoolQ
-    max_l = max(len(x["input_ids"]) for x in batch)
-    input_ids = [x["input_ids"] + [pad_id]*(max_l - len(x["input_ids"])) for x in batch]
-    attention_mask = [x["attention_mask"] + [0]*(max_l - len(x["attention_mask"])) for x in batch]
-    labels = [x["labels"] for x in batch]
-    return {
-        "input_ids": torch.tensor(input_ids, dtype=torch.long),
-        "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
-        "labels": torch.tensor(labels, dtype=torch.long),
+        label = answer_map[answer]
+
+        out = {
+            "labels": label,
+            "question_text": question,
+            "options_text": options,
+            "gold_answer_letter": answer,
+            "keep": True,
+        }
+
+        old_side = tokenizer.truncation_side
+        tokenizer.truncation_side = "left"
+        try:
+            prompt = (
+                f"Passage:\n{article}\n\n"
+                f"Question: {question}\n"
+                "Answer:"
+            )
+            enc_prompt = tokenizer(prompt, add_special_tokens=False)
+
+            for i in range(4):
+                ans_text = " " + options[i]
+                enc_ans = tokenizer(ans_text, add_special_tokens=False)
+
+                max_prompt = max_len - len(enc_ans["input_ids"])
+                max_prompt = max(32, max_prompt)
+
+                prompt_ids = enc_prompt["input_ids"][-max_prompt:]
+                input_ids = (prompt_ids + enc_ans["input_ids"])[:max_len]
+
+                out[f"input_ids_{i}"] = input_ids
+                out[f"attention_mask_{i}"] = [1] * len(input_ids)
+                out[f"prompt_len_{i}"] = min(len(prompt_ids), len(input_ids))
+        finally:
+            tokenizer.truncation_side = old_side
+
+        return out
+
+    processed = {}
+    for split_name in ["train", "validation"]:
+        processed[split_name] = ds[split_name].map(
+            preprocess,
+            remove_columns=ds[split_name].column_names,
+            load_from_cache_file=False,
+        )
+        processed[split_name] = processed[split_name].filter(
+            lambda x: x["keep"],
+            load_from_cache_file=False,
+        )
+        if "keep" in processed[split_name].column_names:
+            processed[split_name] = processed[split_name].remove_columns(["keep"])
+
+    return processed
+
+
+def race_collate_fn(batch, pad_id):
+    def pad_sequence(seqs, pad_val):
+        maxlen = max(len(s) for s in seqs)
+        return [s + [pad_val] * (maxlen - len(s)) for s in seqs]
+
+    out = {
+        "labels": torch.tensor([x["labels"] for x in batch], dtype=torch.long),
+        "question_text": [x["question_text"] for x in batch],
+        "options_text": [x["options_text"] for x in batch],
+        "gold_answer_letter": [x["gold_answer_letter"] for x in batch],
     }
 
-def longqa_binary_forward_step(accum_steps, model, batch, device):
-     # forward step for HotpotQA, Qasper, MultiDoc2Dial"
-    input_ids = batch["input_ids"].to(device)
-    attention_mask = batch["attention_mask"].to(device)
+    for i in range(4):
+        ids_list = [x[f"input_ids_{i}"] for x in batch]
+        msk_list = [x[f"attention_mask_{i}"] for x in batch]
+
+        out[f"input_ids_{i}"] = torch.tensor(
+            pad_sequence(ids_list, pad_id), dtype=torch.long
+        )
+        out[f"attention_mask_{i}"] = torch.tensor(
+            pad_sequence(msk_list, 0), dtype=torch.long
+        )
+        out[f"prompt_len_{i}"] = torch.tensor(
+            [x[f"prompt_len_{i}"] for x in batch], dtype=torch.long
+        )
+
+    return out
+
+
+def race_pack_4way_batch(batch, device, pad_id):
+    input_ids_list = []
+    attention_mask_list = []
+
+    max_t = max(batch[f"input_ids_{i}"].size(1) for i in range(4))
+
+    for i in range(4):
+        ids = batch[f"input_ids_{i}"]
+        msk = batch[f"attention_mask_{i}"]
+        B, T = ids.shape
+
+        if T < max_t:
+            padding_len = max_t - T
+            ids = torch.cat(
+                [ids, torch.full((B, padding_len), pad_id, dtype=torch.long)], dim=1
+            )
+            msk = torch.cat(
+                [msk, torch.zeros((B, padding_len), dtype=torch.long)], dim=1
+            )
+
+        input_ids_list.append(ids)
+        attention_mask_list.append(msk)
+
+    ids = torch.cat(input_ids_list, dim=0).to(device)   # [4B, T]
+    msk = torch.cat(attention_mask_list, dim=0).to(device)  # [4B, T]
+    return ids, msk
+
+
+def compute_race_scores(model, batch, device):
+    """
+    Returns average answer-token NLL per option: [B, 4]
+    Lower is better.
+    """
+    pad_id = model.config.pad_token_id
+    ids, msk = race_pack_4way_batch(batch, device, pad_id)
+
+    B = batch["labels"].size(0)
+    prompt_lens = torch.cat([batch[f"prompt_len_{i}"] for i in range(4)], dim=0).to(device)
+
+    logits = model(input_ids=ids, attention_mask=msk).logits   # [4B, T, V]
+
+    shift_logits = logits[:, :-1, :]
+    shift_ids = ids[:, 1:]
+    shift_msk = msk[:, 1:].float()
+
+    log_probs = F.log_softmax(shift_logits, dim=-1)
+    tok_logp = log_probs.gather(-1, shift_ids.unsqueeze(-1)).squeeze(-1)  # [4B, T-1]
+
+    Tm1 = shift_ids.size(1)
+    positions = torch.arange(Tm1, device=device).unsqueeze(0)
+
+    # answer starts at original token index prompt_len
+    # shifted positions correspond to original token index = pos + 1
+    answer_mask = (positions + 1 >= prompt_lens.unsqueeze(1)).float()
+    answer_mask = answer_mask * shift_msk
+
+    sum_logp = (tok_logp * answer_mask).sum(dim=1)
+    cnt = answer_mask.sum(dim=1).clamp_min(1.0)
+    nll = -(sum_logp / cnt)   # [4B]
+
+    scores = nll.view(4, B).transpose(0, 1).contiguous()   # [B, 4], lower is better
+    return scores
+
+
+def race_forward_step(accum_steps, model, batch, device):
     labels = batch["labels"].to(device)
-    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-    return outputs.loss / accum_steps
+    scores = compute_race_scores(model, batch, device)   # lower = better
+    loss = F.cross_entropy(-scores, labels)
+    return loss / accum_steps
+
 
 @torch.no_grad()
-def longqa_binary_evaluate(model, dev_loader, device):
-    # Evaluation for HotpotQA, Qasper, MultiDoc2Dial
+def race_evaluate(model, dev_loader, device, verbose=False):
     model.eval()
     correct = total = 0
-    for batch in dev_loader:
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        labels = batch["labels"].to(device)
-        
-        logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
-        preds = logits.argmax(dim=-1)
-        correct += (preds == labels).sum().item()
-        total += labels.size(0)
-    model.train()
-    return correct / total
 
+    answer_letters = ["A", "B", "C", "D"]
+
+    with torch.inference_mode():
+        for batch in dev_loader:
+            labels = batch["labels"].to(device)
+            scores = compute_race_scores(model, batch, device)   # [B, 4], lower better
+            preds = scores.argmin(dim=1)
+
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+
+            if verbose:
+                ex_nll = scores.detach().cpu()
+                for i in range(labels.size(0)):
+                    print("=" * 100)
+                    print("QUESTION:")
+                    print(batch["question_text"][i])
+                    print("\nOPTIONS:")
+                    for j, opt in enumerate(batch["options_text"][i]):
+                        marker = ""
+                        if j == labels[i].item():
+                            marker += " [GOLD]"
+                        if j == preds[i].item():
+                            marker += " [PRED]"
+                        print(f"  {answer_letters[j]}. {opt}  nll={ex_nll[i, j].item():.4f}{marker}")
+
+                    print(f"\nGOLD: {answer_letters[labels[i].item()]}")
+                    print(f"PRED: {answer_letters[preds[i].item()]}")
+
+    model.train()
+    return correct / max(total, 1)
+
+
+@torch.no_grad()
+def race_evaluate_verbose(model, dev_loader, device, max_print=10):
+    model.eval()
+    correct = total = 0
+
+    pred_counts = Counter()
+    gold_counts = Counter()
+
+    printed = 0
+
+    for batch in dev_loader:
+        labels = batch["labels"].to(device)
+        scores = compute_race_scores(model, batch, device)   # [B, 4], lower is better
+        preds = scores.argmin(dim=1)
+
+        B = labels.size(0)
+
+        correct += (preds == labels).sum().item()
+        total += B
+
+        for i in range(B):
+            pred_idx = preds[i].item()
+            gold_idx = labels[i].item()
+
+            pred_counts[pred_idx] += 1
+            gold_counts[gold_idx] += 1
+
+            if printed < max_print:
+                print("=" * 100)
+                print("QUESTION:")
+                print(batch["question_text"][i])
+                print("\nOPTIONS:")
+                for j, opt in enumerate(batch["options_text"][i]):
+                    marker = ""
+                    if j == gold_idx:
+                        marker += " [GOLD]"
+                    if j == pred_idx:
+                        marker += " [PRED]"
+                    print(f"  {j} {opt}{marker}")
+
+                print("\nSCORES (lower is better):")
+                ex_scores = scores[i].detach().cpu().tolist()
+                for j, s in enumerate(ex_scores):
+                    print(f"  {j}: {s:.4f}")
+
+                print(f"\nGOLD: {gold_idx} ({batch['gold_answer_letter'][i]})")
+                print(f"PRED: {pred_idx}")
+                printed += 1
+
+    acc = correct / max(total, 1)
+
+    print("\n" + "=" * 100)
+    print(f"RACE accuracy: {acc:.4f}")
+    print("Prediction counts:", dict(pred_counts))
+    print("Gold counts:", dict(gold_counts))
+
+    total_preds = sum(pred_counts.values())
+    if total_preds > 0:
+        print("Prediction fractions:")
+        for k in range(4):
+            print(f"  option {k}: {pred_counts[k] / total_preds:.4f}")
+
+    model.train()
+    return acc, pred_counts, gold_counts
 
 # ---------------- MMLU ----------------
 
@@ -688,7 +1036,7 @@ def build_subject_dataset(tokenizer, max_len, subject):
                 f"You are a highly knowledgeable expert in {subject}. Read the question carefully and choose the best answer. Explain your reasoning briefly before answering."
                 f"Question: {question}\nChoices:\n" +
                 "\n".join([f"{j+1}. {c}" for j, c in enumerate(shuffled_choices)]) +
-                "\nAnswer:"
+                "\nID:"
             )
             full_text = prompt + f" {shuffled_choices[i]}"
 
