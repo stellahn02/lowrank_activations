@@ -85,18 +85,17 @@ def boolq_collate_fn(batch, pad_id):
 def boolq_evaluate(model, dev_loader, device):
     model.eval()
     correct = total = 0
-    
-    with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-        for batch in dev_loader:
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
 
-            logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
-            preds = logits.argmax(dim=-1)
+    for batch in dev_loader:
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels = batch["labels"].to(device)
 
-            correct += (preds == labels).sum().item()
-            total += labels.size(0)
+        logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+        preds = logits.argmax(dim=-1)
+
+        correct += (preds == labels).sum().item()
+        total += labels.size(0)
 
     model.train()
     return correct / total
@@ -105,8 +104,7 @@ def boolq_forward_step(accum_steps, model, batch, device):
     input_ids = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
     labels = batch["labels"].to(device)
-    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
     return outputs.loss / accum_steps
 
 
