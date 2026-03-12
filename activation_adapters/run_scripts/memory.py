@@ -33,6 +33,19 @@ from utils import (
     build_hellaswag_dataset, hellaswag_collate_fn, hellaswag_forward_step, hellaswag_evaluate,
     build_subject_dataset, collate_fn_subject, pack_10way_batch, mmlu_forward_step, evaluate_mmlu,
 ) 
+
+import resource
+
+def get_peak_cpu_memory():
+    # Returns peak memory in kilobytes on Linux/macOS
+    peak_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # Note: macOS returns bytes, Linux returns kilobytes
+    import platform
+    if platform.system() == 'Darwin':  # macOS
+        return peak_kb / 1e6
+    return peak_kb / 1e3  # Linux (convert KB to MB)
+    
+
 # -------------------------
 # Argument Parser
 # -------------------------
@@ -47,7 +60,7 @@ def parse_args():
                         choices=["lora", "adalora", "ia3", "prefix", "prompt", "bitfit", "lars", "full"])
     parser.add_argument("--model_name", type=str, default="llama", 
                         choices=["llama", "qwen"])
-    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--accum_steps", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4) #LARS, LoRA
     parser.add_argument("--epochs", type=int, default=3)
@@ -184,7 +197,15 @@ def apply_bitfit(model):
 def main():
     args = parse_args()
     # os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if torch.backends.mps.is_available():
+        device = "mps"
+    elif torch.cuda.is_available():
+        device = "cuda"
+    else:
+        device = "cpu"
+
 
     wandb.init(project=args.project, config=vars(args))
 
@@ -214,7 +235,7 @@ def main():
                 model_id,
                 num_labels=2,
                 device_map={"": 0},
-                torch_dtype=torch.bfloat16,
+                torch_dtype=torch.float16 if device == "mps" else torch.bfloat16,
                 trust_remote_code=True
             )
 
@@ -278,10 +299,14 @@ def main():
     total_tokens = 0
     latency, inf_tps = None, None
     optimizer.zero_grad()
-    torch.cuda.reset_peak_memory_stats()  # reset memory stats at the start of training
-    torch.cuda.empty_cache()  # clear any cached memory
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.empty_cache()
+    elif torch.backends.mps.is_available():
+        torch.mps.empty_cache()
     for epoch in range(1000):
         for batch_idx, batch in enumerate(train_loader):
+            print(batch_idx)
             start_time = time.time()
             
             if step >= args.total_steps:
@@ -293,9 +318,11 @@ def main():
                 total_tokens += ids.numel()
             else:
                 total_tokens += batch["input_ids"].numel()
-
+            print("0.1")
             loss = forward_step(args.accum_steps, model, batch, device)
+            print("0.2")
             loss.backward()
+            print("0.3")
 
             # inside the accumulation step
             if (batch_idx + 1) % args.accum_steps == 0:
@@ -303,30 +330,35 @@ def main():
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
+                if torch.cuda.is_available():
+                    mem_alloc = torch.cuda.memory_allocated() / 1e6 if torch.cuda.is_available() else 0
+                    mem_peak  = torch.cuda.max_memory_allocated() / 1e6 if torch.cuda.is_available() else 0
+                    mem_reserved = torch.cuda.memory_reserved() / 1e6 if torch.cuda.is_available() else 0
+                if torch.backends.mps.is_available():
+                    mem_peak  = torch.mps.current_allocated_memory() / 1e6
+                else:
+                    mem_peak = get_peak_cpu_memory()
 
-                mem_alloc = torch.cuda.memory_allocated() / 1e6 if torch.cuda.is_available() else 0
-                mem_peak  = torch.cuda.max_memory_allocated() / 1e6 if torch.cuda.is_available() else 0
-                mem_reserved = torch.cuda.memory_reserved() / 1e6 if torch.cuda.is_available() else 0
                 
                 elapsed = time.time() - start_time
                 tokens_per_sec = total_tokens / elapsed if elapsed > 0 else 0
 
                 # evaluate only every 50 steps
                 acc = None
-
-                if step % 50 == 0 and step > 0:
+                print("0.4")
+                if step % 1 == 0 and step > 0:
                     acc = evaluate_fn(model, val_loader, device)
-                    if step % 100 == 0 and latency is None and args.dataset in ["boolq"]:
-                        latency, inf_tps = measure_latency(model, val_loader, device)
+                    # if step % 100 == 0 and latency is None and args.dataset in ["boolq"]:
+                    #     latency, inf_tps = measure_latency(model, val_loader, device)
 
-
+                print("0.5")
                 log_dict = {
                     "loss": float(loss.item() * args.accum_steps),
                     "learning_rate": scheduler.get_last_lr()[0],
                     "grad_norm": float(grad_norm),
-                    "mem_allocated_MB": mem_alloc,
+                    # "mem_allocated_MB": mem_alloc,
                     "mem_peak_MB": mem_peak,
-                    "mem_reserved_MB": mem_reserved,
+                    # "mem_reserved_MB": mem_reserved,
                     "step": step,
                 }
                 if acc is not None:
