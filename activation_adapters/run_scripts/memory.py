@@ -14,6 +14,8 @@ from transformers import (
     LlamaForCausalLM,
     AutoModelForCausalLM
 )
+import random
+import psutil
 from peft import (
     LoraConfig,
     LARSConfig,
@@ -24,6 +26,7 @@ from peft import (
     get_peft_model,
     TaskType,
 )
+from torch.utils.data import Subset
 import wandb
 from tqdm import tqdm
 from utils import ( 
@@ -45,6 +48,21 @@ def get_peak_cpu_memory():
         return peak_kb / 1e6
     return peak_kb / 1e3  # Linux (convert KB to MB)
     
+
+def get_cpu_power_psutil():
+    # Set these once (tuned for your EPYC 9474F)
+    IDLE_POWER = 50.0   # watts
+    MAX_POWER  = 350.0  # watts
+    try:
+        # overall CPU utilization (0–1)
+        cpu_util = psutil.cpu_percent(interval=None) / 100.0
+
+        # linear power model
+        power = IDLE_POWER + cpu_util * (MAX_POWER - IDLE_POWER)
+
+        return power
+    except Exception:
+        return None
 
 # -------------------------
 # Argument Parser
@@ -247,8 +265,21 @@ def main():
 
     train_loader = DataLoader(dataset["train"], batch_size=args.batch_size,
                               shuffle=True, collate_fn=lambda b: collate_fn(b, tokenizer.pad_token_id),)
-    val_loader = DataLoader(dataset["validation"], batch_size=args.batch_size,
-                            shuffle=False, collate_fn=lambda b: collate_fn(b, tokenizer.pad_token_id),)
+    
+    num_samples = 10 * args.batch_size
+    dataset_size = len(dataset["validation"])
+    indices = random.sample(range(dataset_size), min(num_samples, dataset_size))
+    val_subset = Subset(dataset["validation"], indices)
+
+    # ---- USE IT HERE ----
+    val_loader = DataLoader(
+        val_subset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=lambda b: collate_fn(b, tokenizer.pad_token_id),
+    )
+    # val_loader = DataLoader(dataset["validation"], batch_size=args.batch_size,
+    #                         shuffle=False, collate_fn=lambda b: collate_fn(b, tokenizer.pad_token_id),)
 
     model.config.pad_token_id = tokenizer.pad_token_id
 
@@ -271,6 +302,7 @@ def main():
             model.score.to(torch.bfloat16)
 
     args.lr = get_lr(args.peft_method)
+    # model = torch.compile(model)
     model.to(device)
 
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -306,7 +338,7 @@ def main():
         torch.mps.empty_cache()
     for epoch in range(1000):
         for batch_idx, batch in enumerate(train_loader):
-            print(batch_idx)
+            # print(batch_idx)
             start_time = time.time()
             
             if step >= args.total_steps:
@@ -318,11 +350,11 @@ def main():
                 total_tokens += ids.numel()
             else:
                 total_tokens += batch["input_ids"].numel()
-            print("0.1")
+            # print("0.1")
             loss = forward_step(args.accum_steps, model, batch, device)
-            print("0.2")
+            # print("0.2")
             loss.backward()
-            print("0.3")
+            # print("0.3")
 
             # inside the accumulation step
             if (batch_idx + 1) % args.accum_steps == 0:
@@ -345,13 +377,14 @@ def main():
 
                 # evaluate only every 50 steps
                 acc = None
-                print("0.4")
-                if step % 1 == 0 and step > 0:
+                # print("0.4")
+                if step % 50 == 0 and step > 0:
                     acc = evaluate_fn(model, val_loader, device)
                     # if step % 100 == 0 and latency is None and args.dataset in ["boolq"]:
                     #     latency, inf_tps = measure_latency(model, val_loader, device)
-
-                print("0.5")
+                    power = get_cpu_power_psutil()
+                    print(power)
+                # print("0.5")
                 log_dict = {
                     "loss": float(loss.item() * args.accum_steps),
                     "learning_rate": scheduler.get_last_lr()[0],
@@ -360,16 +393,19 @@ def main():
                     "mem_peak_MB": mem_peak,
                     # "mem_reserved_MB": mem_reserved,
                     "step": step,
+                    "time_elapsed_sec": elapsed,
                 }
                 if acc is not None:
                     log_dict["acc"] = acc
                     log_dict["tokens_per_sec"] = tokens_per_sec
+                    log_dict["power"] = power
+                    log_dict["energy"] = power * elapsed if power is not None else None
                 if latency is not None:
                     log_dict["inference_latency_sec"] = latency
                     log_dict["inference_tokens_per_sec"] = inf_tps
 
                 wandb.log(log_dict)
-                print(f"Step {step:04d} | Loss {loss.item()*args.accum_steps:.4f} | LR {scheduler.get_last_lr()[0]:.2e} | GradNorm {grad_norm:.2f} | MemPeak {mem_peak:.1f}MB" + (f" | Acc {acc:.4f}" if acc is not None else ""))
+                print(f"Step {step:04d} | Loss {loss.item()*args.accum_steps:.4f} | LR {scheduler.get_last_lr()[0]:.2e} | GradNorm {grad_norm:.2f} | time {elapsed:.2f} | MemPeak {mem_peak:.1f}MB" + (f" | Acc {acc:.4f}" if acc is not None else ""))
 
                 step += 1
                 total_tokens = 0
