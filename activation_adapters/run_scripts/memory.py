@@ -357,6 +357,21 @@ def main():
 
 
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    # import random
+    # for module in model.modules():
+    #     if module.__class__.__name__ == "LlamaDecoderLayer":
+    #         freeze = random.random() < 0.8
+    #         for p in module.parameters():
+    #             p.requires_grad = not freeze
+            
+    
+    # # # LoRA-FA
+    # for name, param in model.named_parameters():
+    #     # if "lora_A" in name:
+    #     if "A_pool" in name:
+    #         param.requires_grad = False
+
     total_params = sum(p.numel() for p in model.parameters())
 
     wandb.log({
@@ -429,6 +444,7 @@ def main():
                     acc = evaluate_fn(model, val_loader, device)
                     # if step % 100 == 0 and latency is None and args.dataset in ["boolq"]:
                     #     latency, inf_tps = measure_latency(model, val_loader, device)
+                    # handler.adjust_drop_rates_by_sensitivity()
 
                 log_dict = {
                     "loss": float(loss.item() * args.accum_steps),
