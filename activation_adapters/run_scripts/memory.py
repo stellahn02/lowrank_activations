@@ -24,6 +24,7 @@ from peft import (
     PromptTuningConfig,
     get_peft_model,
     TaskType,
+    prepare_model_for_kbit_training,
 )
 import wandb
 from tqdm import tqdm
@@ -37,6 +38,7 @@ from utils import (
     build_quality_dataset, quality_collate_fn, quality_forward_step, quality_evaluate,
     build_race_dataset, race_collate_fn, race_forward_step, race_evaluate, race_evaluate_verbose,
     build_subject_dataset, collate_fn_subject, pack_10way_batch, mmlu_forward_step, evaluate_mmlu,
+    capture_snapshot
 ) 
 
 # -------------------------
@@ -231,7 +233,11 @@ def main():
             bnb_4bit_use_double_quant=True,
         )
     elif args.quantization == "8bit":
-        bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+        bnb_config = BitsAndBytesConfig(
+            load_in_8bit=True,
+            llm_int8_has_fp16_weights=False, # BF16 stability
+            llm_int8_threshold=6.0,          # Standard threshold for outlier detection
+        )
 
 
     wandb.init(project=args.project, config=vars(args))
@@ -270,6 +276,22 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
+    model.config.pad_token_id = tokenizer.pad_token_id
+
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    model.to(device)
+    
+    W_base = torch.cuda.memory_allocated() / 1e6
+    calibration_input = torch.randint(0, 100, (args.batch_size, args.max_len)).to(device)
+
+    model.eval()
+    with torch.no_grad():
+        _ = model(calibration_input)
+
+    base_fwd_peak = torch.cuda.max_memory_allocated() / 1e6
+    A_base = base_fwd_peak - W_base
+    print(f">>> TRUE BASELINE: Weights={W_base:.1f}MB, Activations={A_base:.1f}MB")
 
     # dataset = build_boolq_dataset(tokenizer, args.max_len)
     dataset, evaluate_fn, collate_fn, forward_step = get_dataset(args.dataset, tokenizer, args.max_len)
@@ -322,6 +344,9 @@ def main():
 
     task_type = TaskType.CAUSAL_LM if args.dataset in causal_datasets else TaskType.SEQ_CLS
 
+    if args.quantization in ["4bit", "8bit"]:
+        model = prepare_model_for_kbit_training(model)
+
     # Apply PEFT
     if args.peft_method == "bitfit":
         model = apply_bitfit(model)
@@ -330,7 +355,7 @@ def main():
     else:
         peft_config = get_peft_config(args.peft_method, args.rank, args.total_steps, task_type)
         model = get_peft_model(model, peft_config)
-
+    
     if args.model_name == "qwen":
         model.to(torch.bfloat16)
 
@@ -339,19 +364,39 @@ def main():
             model.score.to(torch.bfloat16)
 
     args.lr = get_lr(args.peft_method)
-    if getattr(model, "is_loaded_in_4bit", False) or getattr(model, "is_loaded_in_8bit", False):
+    compute_dtype = torch.bfloat16
+    if getattr(model, "is_loaded_in_4bit", False):
         for name, param in model.named_parameters():
             if param.requires_grad:
-                param.data = param.data.to(device)
-        
+                param.data = param.data.to(compute_dtype)
+
         if hasattr(model, "modules_to_save") and isinstance(model.modules_to_save, set):
             for name, module in model.named_modules():
                 if any(save_name in name for save_name in model.modules_to_save):
-                    module.to(torch.bfloat16)
-                    print(f"Aligned {name} to bfloat16")
+                    module.to(compute_dtype)
+                    print(f"Aligned {name} to float32")
 
         if hasattr(model, "score"):
-            model.score.to(torch.bfloat16)
+            model.score.to(torch.float32)
+            print("Aligned score head to float32 for 4-bit stability")
+    elif getattr(model, "is_loaded_in_8bit", False):
+        for name, param in model.named_parameters():
+            if param.requires_grad and "score" not in name:
+                param.data = param.data.to(torch.float32)
+
+        if hasattr(model, "modules_to_save") and isinstance(model.modules_to_save, set):
+            for name, module in model.named_modules():
+                if any(save_name in name for save_name in model.modules_to_save):
+                    if "score" in name:
+                        module.to(torch.float32)
+                        print(f"Aligned {name} to float32")
+                    else:
+                        module.to(torch.float32)
+                        print(f"Aligned {name} to {torch.float32}")
+
+        if hasattr(model, "score"):
+            model.score.to(torch.float32)
+            print("Aligned score head to float32 for 8-bit stability")
     else:
         model.to(device)
 
@@ -375,6 +420,25 @@ def main():
         num_training_steps=args.total_steps,
     )
 
+    print("==== model class ====")
+    print(type(model))
+
+    print("==== modules_to_save ====")
+    print(getattr(model, "modules_to_save", None))
+
+    print("==== trainable params ====")
+    trainable = 0
+    for name, p in model.named_parameters():
+        if p.requires_grad:
+            trainable += p.numel()
+            print(name, p.shape, p.dtype, p.device)
+    print("trainable total:", trainable)
+
+    print("==== dtype histogram ====")
+    d = {}
+    for _, p in model.named_parameters():
+        d[str(p.dtype)] = d.get(str(p.dtype), 0) + p.numel()
+    print(d)
 
     model.train()
     # Training loop
@@ -404,6 +468,55 @@ def main():
                 choice_keys = [k for k in batch.keys() if k.startswith("input_ids_")]
                 for key in choice_keys:
                     total_tokens += batch[key].numel()
+            
+            if step == 10:
+                torch.cuda.synchronize()
+                m_alloc_at_rest = torch.cuda.memory_allocated() / 1e6 
+                
+                dummy_ids = torch.randint(0, 100, (args.batch_size, 512)).to(device)
+                dummy_labels = torch.zeros(args.batch_size, dtype=torch.long).to(device)
+                
+                outputs = model(input_ids=dummy_ids, labels=dummy_labels)
+                torch.cuda.synchronize()
+                fwd_peak = torch.cuda.max_memory_allocated() / 1e6
+                
+                total_act_mem = fwd_peak - m_alloc_at_rest
+                act_overhead = total_act_mem - A_base
+
+                outputs.loss.backward()
+                bwd_peak = torch.cuda.max_memory_allocated() / 1e6 
+                
+
+                grad_mem = sum(p.grad.element_size() * p.grad.nelement() 
+                            for p in model.parameters() if p.grad is not None) / 1e6
+                
+
+                opt_mem = 0
+                for group in optimizer.param_groups:
+                    for p in group['params']:
+                        state = optimizer.state[p]
+                        for x in state.values():
+                            if isinstance(x, torch.Tensor):
+                                opt_mem += x.element_size() * x.nelement()
+                opt_mem /= 1e6
+
+
+                weights_overhead = (m_alloc_at_rest - opt_mem) - W_base
+                current_net_splash = fwd_peak - m_alloc_at_rest
+                act_overhead = (fwd_peak - m_alloc_at_rest) - A_base
+
+                print(f"Total Peak Increase: {current_net_splash:.2f} MB")
+                print(f"\n--- {args.peft_method.upper()} MEMORY REPORT (STEP 10) ---")
+                print(f"Adapter Weights:     {weights_overhead:.2f} MB")
+                print(f"Adapter Gradients:   {grad_mem:.2f} MB")
+                print(f"Adapter Opt States:  {opt_mem:.2f} MB")
+                print(f"Adapter Activations: {act_overhead:.2f} MB\n")
+                
+
+                optimizer.zero_grad(set_to_none=True)
+                torch.cuda.reset_peak_memory_stats()
+                step += 1
+                continue
 
             loss = forward_step(args.accum_steps, model, batch, device)
             loss.backward()
@@ -459,4 +572,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
 
