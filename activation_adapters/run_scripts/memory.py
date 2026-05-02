@@ -485,8 +485,8 @@ def main():
                 # print("0.4")
                 if step % 50 == 0 and step > 0:
                     acc = evaluate_fn(model, val_loader, device)
-                    if step % 100 == 0 and latency is None and args.dataset in ["boolq"]:
-                        latency, inf_tps = measure_latency(model, val_loader, device)
+                    # if step % 100 == 0 and latency is None and args.dataset in ["boolq"]:
+                    #     latency, inf_tps = measure_latency(model, val_loader, device)
                     power = get_cpu_power_psutil()
                     print(power)
                 # print("0.5")
